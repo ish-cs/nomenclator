@@ -13,9 +13,10 @@ Usage: python context-server.py
 """
 
 import json
+import os
 import urllib.request
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
@@ -24,6 +25,9 @@ SCREENPIPE_URL = "http://localhost:3030"
 PORT = 3031
 DEFAULT_LIMIT = 15
 DEFAULT_WINDOW_HOURS = 24
+
+BROWSER_CAPTURES_FILE = os.path.expanduser("~/.screenpipe/browser_captures.json")
+BROWSER_CAPTURES_MAX = 1000   # max entries stored
 
 STOP_WORDS = frozenset([
     'what','have','i','been','the','a','an','is','are','was','were',
@@ -72,6 +76,112 @@ def cors_headers():
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type',
         'Content-Type': 'application/json',
+    }
+
+
+# ── Browser captures storage ─────────────────────────────────────────
+_browser_captures = []   # in-memory list, loaded from file on start
+
+
+def load_browser_captures():
+    global _browser_captures
+    try:
+        if os.path.exists(BROWSER_CAPTURES_FILE):
+            with open(BROWSER_CAPTURES_FILE, 'r') as f:
+                _browser_captures = json.load(f)
+    except Exception:
+        _browser_captures = []
+
+
+def save_browser_capture(entry):
+    global _browser_captures
+    entry['received_at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    _browser_captures.append(entry)
+    if len(_browser_captures) > BROWSER_CAPTURES_MAX:
+        _browser_captures = _browser_captures[-BROWSER_CAPTURES_MAX:]
+    try:
+        os.makedirs(os.path.dirname(BROWSER_CAPTURES_FILE), exist_ok=True)
+        with open(BROWSER_CAPTURES_FILE, 'w') as f:
+            json.dump(_browser_captures, f)
+    except Exception:
+        pass
+
+
+def get_browser_captures(limit=50):
+    return list(reversed(_browser_captures[-limit:]))
+
+
+# ── Anomaly detection ────────────────────────────────────────────────
+def get_anomalies(days=7):
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    today_data = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT app_name, COUNT(*) as cnt FROM frames "
+            f"WHERE date(timestamp)='{today}' AND app_name IS NOT NULL AND app_name != '' "
+            f"GROUP BY app_name ORDER BY cnt DESC"
+        )
+    }) or []
+
+    hist_data = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT app_name, date(timestamp) as day, COUNT(*) as cnt FROM frames "
+            f"WHERE date(timestamp) < '{today}' "
+            f"AND date(timestamp) >= date('{today}', '-{days} days') "
+            f"AND app_name IS NOT NULL AND app_name != '' "
+            f"GROUP BY app_name, day"
+        )
+    }) or []
+
+    # Build per-app daily averages from history
+    app_daily = defaultdict(list)
+    for row in hist_data:
+        app = row.get('app_name', '')
+        if app:
+            app_daily[app].append(int(row.get('cnt', 0)))
+
+    app_avg = {app: sum(counts) / len(counts) for app, counts in app_daily.items() if counts}
+
+    today_by_app = {row.get('app_name', ''): int(row.get('cnt', 0)) for row in today_data if row.get('app_name')}
+    total_today = sum(today_by_app.values()) or 1
+
+    anomalies = []
+    all_apps = set(list(today_by_app.keys()) + list(app_avg.keys()))
+
+    for app in all_apps:
+        today_cnt = today_by_app.get(app, 0)
+        avg_cnt = app_avg.get(app, 0)
+        pct = round(today_cnt / total_today * 100)
+
+        if avg_cnt == 0 and today_cnt >= 20:
+            anomalies.append({
+                'app': app, 'today': today_cnt, 'avg': 0,
+                'ratio': None, 'type': 'new', 'pct_of_day': pct,
+                'message': f"{app} appeared for the first time ({today_cnt} frames, {pct}% of today)",
+            })
+        elif avg_cnt > 0:
+            ratio = today_cnt / avg_cnt
+            if ratio >= 2.0 and today_cnt >= 20:
+                anomalies.append({
+                    'app': app, 'today': today_cnt, 'avg': round(avg_cnt, 1),
+                    'ratio': round(ratio, 2), 'type': 'high', 'pct_of_day': pct,
+                    'message': f"{app}: {today_cnt} frames today vs {avg_cnt:.0f} avg ({ratio:.1f}x more than usual)",
+                })
+            elif ratio <= 0.3 and avg_cnt >= 20:
+                anomalies.append({
+                    'app': app, 'today': today_cnt, 'avg': round(avg_cnt, 1),
+                    'ratio': round(ratio, 2), 'type': 'low', 'pct_of_day': pct,
+                    'message': f"{app}: only {today_cnt} frames today vs {avg_cnt:.0f} avg ({ratio:.2f}x of usual)",
+                })
+
+    anomalies.sort(key=lambda x: abs((x.get('ratio') or 3.0)), reverse=True)
+
+    return {
+        'date': today,
+        'days_compared': days,
+        'total_frames_today': total_today,
+        'anomalies': anomalies,
+        'generated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
     }
 
 
@@ -256,26 +366,91 @@ class ContextHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(200, result)
 
+        elif parsed.path == '/anomalies':
+            days = int(p('days', 7))
+            self.send_json(200, get_anomalies(days))
+
+        elif parsed.path == '/semantic':
+            query = p('q', '')
+            limit = int(p('limit', DEFAULT_LIMIT))
+            if not query:
+                self.send_json(400, {'error': 'q parameter required'})
+                return
+            try:
+                import semantic_search as ss
+                client = ss.get_client()
+                col = ss.get_collection(client)
+                embedder = ss.get_embedder()
+                result = ss.semantic_query(query, n_results=limit, embedder=embedder, collection=col)
+                self.send_json(200, result)
+            except ImportError:
+                self.send_json(503, {
+                    'error': 'Semantic search not available.',
+                    'fix': 'pip install chromadb sentence-transformers',
+                })
+            except Exception as e:
+                self.send_json(500, {'error': str(e)})
+
+        elif parsed.path == '/browser-captures':
+            limit = int(p('limit', 50))
+            self.send_json(200, {
+                'total': len(_browser_captures),
+                'results': get_browser_captures(limit),
+            })
+
         else:
-            self.send_json(404, {'error': 'not found', 'endpoints': ['/health', '/context', '/summary']})
+            self.send_json(404, {'error': 'not found', 'endpoints': [
+                '/health', '/context', '/summary', '/anomalies',
+                '/semantic', '/browser-captures', 'POST /browser-capture',
+            ]})
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+
+        if parsed.path == '/browser-capture':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                entry = json.loads(body.decode())
+                save_browser_capture(entry)
+                self.send_json(200, {'ok': True, 'total': len(_browser_captures)})
+            except Exception as e:
+                self.send_json(400, {'error': str(e)})
+        else:
+            self.send_json(404, {'error': 'not found'})
 
 
 # ── Main ─────────────────────────────────────────────────────────────
 def main():
+    load_browser_captures()
+
     print()
     print("  ┌─────────────────────────────────────┐")
-    print("  │       Augur Context API v0.1         │")
+    print("  │       Augur Context API v0.2         │")
     print("  │       localhost:3031                 │")
     print("  └─────────────────────────────────────┘")
     print()
     sp = screenpipe_ok()
     icon = '  v' if sp else '  x'
     print(f"{icon}  screenpipe: {'connected' if sp else 'NOT reachable (start screenpipe first)'}")
+    print(f"  v  browser captures loaded: {len(_browser_captures)}")
+
+    try:
+        import chromadb  # noqa
+        import sentence_transformers  # noqa
+        print("  v  semantic search: available")
+    except ImportError:
+        print("  -  semantic search: not available (pip install chromadb sentence-transformers)")
+
     print()
     print("  Endpoints:")
-    print("    GET /health")
-    print("    GET /context?q=...&limit=15&window_hours=24")
-    print("    GET /summary?date=YYYY-MM-DD")
+    print("    GET  /health")
+    print("    GET  /context?q=...&limit=15&window_hours=24")
+    print("    GET  /summary?date=YYYY-MM-DD")
+    print("    GET  /anomalies?days=7")
+    print("    GET  /semantic?q=...&limit=15")
+    print("    GET  /browser-captures?limit=50")
+    print("    POST /browser-capture  (JSON body)")
     print()
     print("  Press Ctrl+C to stop.")
     print()

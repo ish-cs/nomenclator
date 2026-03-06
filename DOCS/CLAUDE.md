@@ -28,6 +28,13 @@ The user (Ishaan) is building a startup around a **personal context layer for AI
   launch.command              # Double-click launcher (Python 3)
   context-server.py           # Context API server on port 3031 — the core product
   demo_agent.py               # Agent integration demo / investor demo
+  semantic_search.py          # Chroma vector store + sentence-transformers indexer
+  mcp_server.py               # MCP server (v0.3) — Claude Desktop / Cursor integration
+  requirements.txt            # pip deps: chromadb, sentence-transformers
+  test_features.py            # Feature test suite (offline + --live modes)
+  PLAN.md                     # v0.3 deep implementation plan
+  extension/                  # Chrome MV3 browser extension
+    manifest.json, background.js, content.js, popup.html/js/css
   DOCS/PRODUCT.md             # Full technical product documentation
   DOCS/CLAUDE.md              # This file
 ```
@@ -53,13 +60,14 @@ The user (Ishaan) is building a startup around a **personal context layer for AI
   - Fonts: JetBrains Mono + Syne from Google Fonts
   - Dark terminal aesthetic, green (#00ff87) accent color
 
-## Dashboard features (v0.1)
+## Dashboard features (v0.2)
 1. **Live Feed tab** — recent OCR+audio captures as expandable cards
 2. **Search Results tab** — full-text search, highlighted matches
 3. **Raw SQL tab** — direct SQLite queries, auto-detected table output, presets
 4. **Ask AI tab** — chat with LM Studio; smart context injection; persistent localStorage memory (50-msg cap, clear button)
 5. **Timeline tab** — gantt chart of today's app activity by hour; click block → detail panel
-6. **Sidebar**: Refresh, Auto-refresh, Export JSON, Today's Summary, Export Context Snapshot, Stop screenpipe
+6. **Anomalies tab** (v0.2) — behavioral anomaly detection vs N-day rolling baseline; requires context-server.py
+7. **Sidebar**: Refresh, Auto-refresh, Export JSON, Today's Summary, Export Context Snapshot, Stop screenpipe
 
 ## AI context system (important)
 Always-on smart search. For every question:
@@ -95,8 +103,12 @@ Always-on smart search. For every question:
 3. Open LM Studio → Local Server → enable CORS → load a model → Start Server
 4. Open `screenpipe-dashboard.html` in Chrome
 
-## Next things to build (v0.2)
-- Semantic search / vector embeddings (Chroma)
-- Browser extension
-- Anomaly detection
+## Next things to build (v0.3) — see PLAN.md for full detail
+- Browser extension captures wired into `/context` ranking (dwell time + selection bonuses)
+- Hybrid context scoring: semantic similarity blended with keyword score
+- Auto-start semantic indexer from `launch.command`
+- Claude + OpenAI API backends in `demo_agent.py` via `--api` flag
+- MCP server (`mcp_server.py`) for native Claude Desktop / Cursor integration
+- `/profile` and `/context-card` API endpoints
+- Dashboard: browser captures tab + semantic search mode toggle
 

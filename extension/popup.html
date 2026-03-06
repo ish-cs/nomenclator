@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Augur</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<div class="header">
+  <div class="logo">
+    <div class="dot" id="statusDot"></div>
+    Augur
+  </div>
+  <div class="subtitle">Browser Context Capture</div>
+</div>
+
+<div class="status-row">
+  <span class="label">Context API</span>
+  <span class="badge" id="apiBadge">checking...</span>
+</div>
+<div class="status-row">
+  <span class="label">Captures today</span>
+  <span class="badge" id="countBadge">—</span>
+</div>
+
+<div class="section-label">recent captures</div>
+<div id="captures">
+  <div class="empty">Loading...</div>
+</div>
+
+<div class="footer">
+  <a href="http://localhost:3031/browser-captures" target="_blank">view all →</a>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

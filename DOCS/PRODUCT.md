@@ -1,6 +1,6 @@
 # Augur — Product Document
 
-# CURRENT VERSION: v0.1
+# CURRENT VERSION: v0.2 (v0.3 in planning — see PLAN.md)
 
 ---
 
@@ -8,10 +8,13 @@
 
 Augur is a **personal context layer for AI agents** — built on top of [screenpipe](https://github.com/mediar-ai/screenpipe), an open-source tool that continuously captures and OCRs your screen and audio.
 
-**v0.1 ships two things:**
+**v0.2 shipped five things:**
 
 1. **A Context API** (`context-server.py`) — a local HTTP server any AI agent can query to get ranked, relevant screen context. This is the actual product.
-2. **A Dashboard** (`screenpipe-dashboard.html`) — a browser UI for exploring captured data, with AI chat, search, SQL access, timeline, and more. This is the research/demo surface.
+2. **A Dashboard** (`screenpipe-dashboard.html`) — a browser UI for exploring captured data, with AI chat, search, SQL access, timeline, anomaly detection, and more. This is the research/demo surface.
+3. **Semantic search** (`semantic_search.py`) — Chroma vector store + sentence-transformers embeddings. Indexes screenpipe captures for meaning-based retrieval beyond keyword matching.
+4. **Browser extension** (`extension/`) — MV3 Chrome extension that captures URL, title, selected text, time on page, and scroll depth, and sends them to the Context API.
+5. **Anomaly detection** — Dashboard tab + `/anomalies` API endpoint that surfaces unusual behavioral patterns by comparing today's app usage against a rolling N-day baseline.
 
 Everything runs locally. No data leaves the machine. No API keys required.
 
@@ -64,6 +67,14 @@ nomenclator/
 ├── launch.command              # Double-click launcher (starts everything)
 ├── context-server.py           # Context API server — the actual product
 ├── demo_agent.py               # Agent integration demo / investor demo
+├── semantic_search.py          # Chroma vector store indexer + semantic query
+├── requirements.txt            # pip deps (chromadb, sentence-transformers)
+├── test_features.py            # Feature test suite
+├── extension/                  # Chrome browser extension (MV3)
+│   ├── manifest.json
+│   ├── background.js           # Service worker: sends tab data to context API
+│   ├── content.js              # Page script: tracks time, scroll, selections
+│   ├── popup.html/js/css       # Extension popup UI
 ├── README.md
 └── DOCS/
     ├── PRODUCT.md              # This file
@@ -72,11 +83,13 @@ nomenclator/
 
 Supporting binaries / apps (not in this repo):
 ```
-~/bin/screenpipe              # screenpipe binary
-LM Studio.app                 # GUI app for running local LLMs
-~/.screenpipe/data/           # Raw video/audio (~1–2 GB/day, auto-cleaned)
-~/.screenpipe/db.sqlite       # SQLite database with OCR + audio records
-~/.screenpipe/launcher.log    # Log file from launch.command
+~/bin/screenpipe                       # screenpipe binary
+LM Studio.app                          # GUI app for running local LLMs
+~/.screenpipe/data/                    # Raw video/audio (~1–2 GB/day, auto-cleaned)
+~/.screenpipe/db.sqlite                # SQLite database with OCR + audio records
+~/.screenpipe/launcher.log             # Log file from launch.command
+~/.screenpipe/browser_captures.json   # Browser extension captures (max 1000)
+~/.screenpipe/augur_semantic_db/       # Chroma persistent vector store
 ```
 
 ---
@@ -128,15 +141,23 @@ Python stdlib HTTP server running at `http://localhost:3031`.
 | Endpoint | Description |
 |---|---|
 | `GET /health` | Returns `{ status, screenpipe, port }` |
-| `GET /context?q=...&limit=N&window_hours=H` | Ranked context for a query |
+| `GET /context?q=...&limit=N&window_hours=H` | Keyword-ranked context for a query (+ browser captures in v0.3) |
+| `GET /semantic?q=...&limit=N` | Semantic (embedding-based) context search |
 | `GET /summary?date=YYYY-MM-DD` | Structured daily summary JSON |
+| `GET /anomalies?days=N` | Behavioral anomaly report vs N-day baseline |
+| `GET /browser-captures?limit=N` | Recent browser extension captures |
+| `POST /browser-capture` | Receive a capture from browser extension |
+| `GET /profile?days=N` | Rich behavioral profile over N days (v0.3) |
+| `GET /context-card?days=N` | Ultra-compact profile string for LLM injection (v0.3) |
 
-**Context response shape:**
+**Context response shape (v0.3):**
 ```json
 {
   "query": "what was I working on",
   "keywords": ["working"],
   "total_candidates": 47,
+  "browser_captures_included": 3,
+  "semantic_enhanced": true,
   "results": [
     {
       "frame_id": "...",
@@ -145,19 +166,33 @@ Python stdlib HTTP server running at `http://localhost:3031`.
       "window": "nomenclator/screenpipe-dashboard.html",
       "text": "function sendAI() {",
       "url": null,
-      "score": 4.2
+      "score": 4.2,
+      "source": "ocr"
+    },
+    {
+      "frame_id": "browser_98765432",
+      "timestamp": "2026-03-05T14:20:00Z",
+      "app": "Browser",
+      "window": "Augur Context Layer - GitHub",
+      "text": "personal context layer for AI agents",
+      "url": "https://github.com/ish-cs/nomenclator",
+      "score": 3.7,
+      "source": "browser"
     }
   ],
   "generated_at": "2026-03-05T14:25:00Z"
 }
 ```
 
-**Scoring algorithm:**
+**Scoring algorithm (v0.3 hybrid):**
 ```
-score = (keyword_match_count × 3) + recency_score
+score = (keyword_match_count × 3) + recency_score + semantic_bonus + [time_bonus + selection_bonus for browser]
 ```
-- `keyword_match_count`: regex hits across text + app + window, capped at 5 per keyword
+- `keyword_match_count`: substring hits across text + app + window + url, capped at 5 per keyword
 - `recency_score`: `max(0, 1 - age_seconds / window_hours_in_seconds)` — decays to 0 at the window boundary
+- `semantic_bonus`: `cosine_similarity × 2.0` — only when Chroma index is populated (otherwise 0)
+- `time_bonus` (browser only): `min(time_on_page_s / 300, 1.0)` — up to 1.0 for 5+ minutes dwell time
+- `selection_bonus` (browser only): `+2.0` if user selected text on that page (strong intent signal)
 
 **CORS:** all responses include `Access-Control-Allow-Origin: *`.
 
@@ -228,6 +263,13 @@ Direct SQLite queries. Results as auto-detected table. Two preset shortcuts (top
 
 ### Tab 4: Ask AI ✦
 Chat interface with automatic context injection. See AI Features section below.
+
+### Tab 6: Anomalies (new in v0.2)
+Behavioral anomaly detection. Compares today's per-app frame counts against a rolling N-day baseline (default 7). Flags:
+- **▲ More than usual** — app usage ≥2x daily average (minimum 20 frames)
+- **▼ Less than usual** — app usage ≤0.3x daily average
+- **★ New app** — app not seen in the baseline window
+Configurable window (7/14/30 days). Refresh on demand. Requires context-server.py running.
 
 ### Tab 5: Timeline (new in v0.1)
 Gantt-style chart of today's app activity:
@@ -401,7 +443,18 @@ The live feed polls every 5 seconds. The "LIVE" badge is cosmetic.
 - [x] Auto-cleanup of raw files at launch
 - [x] Context snapshot export (7-day behavioral profile JSON)
 
-### v0.2 (next)
-- [ ] Semantic search via local vector embeddings (Chroma)
-- [ ] Browser extension for richer URL + selection context
-- [ ] Anomaly detection — alert when screen activity pattern deviates significantly
+### v0.2 (shipped)
+- [x] Semantic search — Chroma vector store + `all-MiniLM-L6-v2` embeddings (`semantic_search.py`, `/semantic` endpoint)
+- [x] Browser extension — MV3 Chrome extension (`extension/`), captures URL + title + selected text + time on page + scroll depth
+- [x] Anomaly detection — dashboard tab + `/anomalies` API, compares today vs rolling N-day baseline
+
+### v0.3 (planned — see PLAN.md)
+- [ ] Browser extension captures wired into `/context` ranking (dwell time + selection bonus scoring)
+- [ ] Hybrid context scoring — semantic similarity blended with keyword score when Chroma index is populated
+- [ ] Auto-start semantic indexer from `launch.command` as a 4th managed service
+- [ ] Claude + OpenAI API backends in `demo_agent.py` alongside LM Studio (`--api claude|openai`)
+- [ ] MCP server (`mcp_server.py`) — expose Augur tools natively to Claude Desktop, Cursor, and any MCP agent
+- [ ] `/profile` endpoint — rich 7-day behavioral profile (top apps + hours + domains + topics)
+- [ ] `/context-card` endpoint — ultra-compact profile string for drop-in LLM system prompt injection
+- [ ] Dashboard: Browser Activity tab showing recent extension captures
+- [ ] Dashboard: Semantic search mode toggle in the Search tab

@@ -14,14 +14,19 @@ Everything runs locally. No cloud, no API keys, no data leaves your machine.
 ```bash
 curl "http://localhost:3031/context?q=what+was+I+working+on"
 ```
-Returns relevance-ranked screen captures for any natural language query. Any AI agent or tool can call this.
+Returns relevance-ranked screen captures + browser activity for any natural language query. Any AI agent or tool can call this.
+
+### MCP Server (v0.3)
+Drop-in integration with Claude Desktop, Cursor, and any MCP-compatible AI agent. Configure once — your AI agent automatically knows your screen context with no code changes.
 
 ### Dashboard
 - **Live Feed** — real-time view of OCR captures and audio transcriptions
-- **Search** — full-text search across your entire screen history
+- **Search** — full-text search (keyword and semantic modes) across your entire screen history
 - **Raw SQL** — direct queries against the screenpipe SQLite database
 - **Ask AI** — chat with a local LLM that has automatic access to your screen context
 - **Timeline** — gantt-style chart of today's app activity by hour
+- **Anomalies** — behavioral anomaly detection vs rolling N-day baseline
+- **Browser Activity** — recent browser extension captures (URL, dwell time, selections)
 - **Today's Summary** — one-click AI-generated digest: activities, apps, topics, action items
 - **Context Snapshot** — export a 7-day behavioral profile as structured JSON
 - **Storage Management** — view DB size, clean up old records
@@ -146,11 +151,17 @@ The core product. Any script or agent can call it:
 # Health check
 curl http://localhost:3031/health
 
-# Get context for a query
+# Get context for a query (includes browser captures + semantic scoring in v0.3)
 curl "http://localhost:3031/context?q=typescript+react&limit=10"
 
 # Daily summary
 curl "http://localhost:3031/summary?date=2026-03-05"
+
+# Behavioral profile (v0.3)
+curl "http://localhost:3031/profile?days=7"
+
+# Compact profile for LLM injection (v0.3)
+curl "http://localhost:3031/context-card"
 ```
 
 **Parameters for `/context`:**
@@ -158,21 +169,61 @@ curl "http://localhost:3031/summary?date=2026-03-05"
 - `limit` — number of results (default: 15)
 - `window_hours` — recency window for scoring (default: 24)
 
-Results are scored by `(keyword_matches × 3) + recency` and returned ranked.
+Results are scored by `(keyword_matches × 3) + recency + semantic_bonus + browser_bonuses` and returned ranked.
+
+## MCP Server (Claude Desktop / Cursor)
+
+Configure Augur as an MCP server so Claude Desktop automatically has access to your screen context:
+
+**1. Add to `~/.claude/claude_desktop_config.json`:**
+```json
+{
+  "mcpServers": {
+    "augur": {
+      "command": "python3",
+      "args": ["/Users/YOUR_NAME/Desktop/nomenclator/mcp_server.py"]
+    }
+  }
+}
+```
+
+**2. Restart Claude Desktop.** The following tools appear automatically:
+- `get_context` — ranked screen captures for any query
+- `get_daily_summary` — today's activity breakdown
+- `get_anomalies` — behavioral anomalies vs baseline
+- `get_user_profile` — 7-day behavioral profile
+- `get_browser_activity` — recent browser captures
+
+The Context API (`context-server.py`) must be running for MCP tools to return data.
 
 ---
 
 ## Agent Integration Demo
 
 ```bash
-# Single query mode
+# Single query mode (uses LM Studio by default)
 python3 demo_agent.py "what have I been working on today?"
+
+# Use Claude API (requires ANTHROPIC_API_KEY)
+python3 demo_agent.py "what have I been working on?" --api claude
+
+# Use OpenAI API (requires OPENAI_API_KEY)
+python3 demo_agent.py "what have I been working on?" --api openai
 
 # Watch mode — polls every 30s, summarizes activity changes
 python3 demo_agent.py --watch
+python3 demo_agent.py --watch --api claude
 ```
 
-The demo script calls the Context API, injects the results as context, then calls LM Studio to answer. Watch mode shows agents being proactively fed context as your activity changes.
+The demo calls the Context API, injects ranked screen context, then calls your chosen LLM backend. Watch mode shows agents being proactively fed context as your activity changes.
+
+**Optional setup for cloud LLM backends:**
+```bash
+pip install anthropic   # for --api claude
+pip install openai      # for --api openai
+export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
+```
 
 ---
 
@@ -183,11 +234,21 @@ nomenclator/
 ├── screenpipe-dashboard.html   # Full browser dashboard (single self-contained file)
 ├── launch.command              # Double-click launcher — starts everything
 ├── context-server.py           # Context API server (port 3031) — the core product
-├── demo_agent.py               # Agent integration demo / investor demo
+├── demo_agent.py               # Agent integration demo (LM Studio, Claude, OpenAI)
+├── semantic_search.py          # Chroma vector store indexer + semantic query
+├── mcp_server.py               # MCP server for Claude Desktop / Cursor (v0.3)
+├── requirements.txt            # pip deps
+├── test_features.py            # Feature test suite
+├── extension/                  # Chrome browser extension (MV3)
+│   ├── manifest.json
+│   ├── background.js
+│   ├── content.js
+│   └── popup.html/js/css
 ├── README.md
 └── DOCS/
     ├── PRODUCT.md              # Full technical product documentation
-    └── CLAUDE.md               # Project context for AI-assisted development
+    ├── CLAUDE.md               # Project context for AI-assisted development
+    └── (PLAN.md in root)       # v0.3 implementation plan
 ```
 
 ---
@@ -275,10 +336,19 @@ Grant permissions in System Settings → Privacy & Security:
 - [x] Auto-cleanup of raw files at launch
 - [x] Context snapshot export (7-day behavioral profile JSON)
 
-### v0.2 (next)
-- [ ] Semantic search via local vector embeddings (Chroma)
-- [ ] Browser extension for richer URL and selection context
-- [ ] Anomaly detection
+### v0.2 (shipped)
+- [x] Semantic search via local vector embeddings (Chroma + `all-MiniLM-L6-v2`)
+- [x] Browser extension (MV3) — URL, title, dwell time, scroll depth, text selection
+- [x] Anomaly detection — dashboard tab + `/anomalies` API
+
+### v0.3 (planned)
+- [ ] Browser captures merged into `/context` ranking (dwell time + selection scoring)
+- [ ] Hybrid scoring — semantic + keyword blended transparently
+- [ ] Semantic indexer auto-started from `launch.command`
+- [ ] Claude + OpenAI API backends in `demo_agent.py`
+- [ ] MCP server — native integration with Claude Desktop, Cursor, and MCP-compatible agents
+- [ ] `/profile` + `/context-card` endpoints
+- [ ] Dashboard: Browser Activity tab + semantic search mode toggle
 
 ---
 

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Augur Browser Capture",
+  "version": "0.1.0",
+  "description": "Sends browser context (URL, title, selected text, time on page) to the Augur Context API running at localhost:3031.",
+  "permissions": ["activeTab", "tabs", "storage"],
+  "host_permissions": ["http://localhost:3031/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Augur"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

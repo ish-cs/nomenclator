@@ -882,6 +882,49 @@
     margin-left: 6px;
     vertical-align: middle;
   }
+
+  /* ── Anomaly panel ── */
+  .anomaly-card {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin-bottom: 10px;
+    background: var(--surface);
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+  }
+  .anomaly-card.high { border-left: 3px solid var(--amber); }
+  .anomaly-card.low  { border-left: 3px solid var(--blue); }
+  .anomaly-card.new  { border-left: 3px solid var(--green); }
+  .anomaly-icon {
+    font-size: 18px;
+    line-height: 1;
+    width: 24px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .anomaly-msg {
+    flex: 1;
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .anomaly-sub {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--dim);
+    display: flex;
+    gap: 14px;
+  }
+  .anomaly-sub span { white-space: nowrap; }
+  .anomaly-meta {
+    font-size: 10px;
+    color: var(--dimmer);
+    padding: 8px 0 4px;
+    border-top: 1px solid var(--border);
+    margin-top: 8px;
+  }
 </style>
 </head>
 <body>
@@ -990,6 +1033,7 @@
       <div class="tab" onclick="switchTab('raw', this)">Raw SQL</div>
       <div class="tab" onclick="switchTab('ai', this)">✦ Ask AI</div>
       <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
+      <div class="tab" onclick="switchTab('anomalies', this)">Anomalies</div>
       <div class="live-badge" style="margin-left:auto;padding:12px 0">
         <div class="live-dot"></div>
         LIVE
@@ -1090,6 +1134,29 @@
         </div>
       </div>
       <div class="timeline-detail" id="timelineDetail"></div>
+    </div>
+
+    <!-- Anomalies tab -->
+    <div class="feed" id="anomaliesTab" style="display:none;flex-direction:column;gap:0">
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:0 0 16px">
+        <div>
+          <div class="section-label">behavioral anomaly detection · today vs last 7 days</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <select id="anomalyDays" style="background:var(--surface);border:1px solid var(--border);color:var(--dim);padding:4px 8px;font-family:var(--mono);font-size:11px">
+            <option value="7">vs last 7 days</option>
+            <option value="14">vs last 14 days</option>
+            <option value="30">vs last 30 days</option>
+          </select>
+          <button class="search-btn" onclick="loadAnomalies()" style="font-size:10px;padding:6px 14px">↺ Refresh</button>
+        </div>
+      </div>
+      <div id="anomalyContent">
+        <div class="empty">
+          <div class="empty-icon">⚠</div>
+          <div class="empty-title">Loading anomalies...</div>
+        </div>
+      </div>
     </div>
 
   </div>
@@ -1660,8 +1727,10 @@ function switchTab(name, el) {
   document.getElementById('rawTab').style.display = name === 'raw' ? 'flex' : 'none';
   document.getElementById('aiTab').style.display = name === 'ai' ? 'flex' : 'none';
   document.getElementById('timelineTab').style.display = name === 'timeline' ? 'flex' : 'none';
+  document.getElementById('anomaliesTab').style.display = name === 'anomalies' ? 'flex' : 'none';
   if (name === 'ai') setTimeout(() => document.getElementById('aiInput').focus(), 100);
   if (name === 'timeline') loadTimeline();
+  if (name === 'anomalies') loadAnomalies();
 }
 
 // ── Auto refresh ──────────────────────────────────────────────────
@@ -1974,6 +2043,77 @@ function showTyping() {
 function removeTyping() {
   const el = document.getElementById('typingMsg');
   if (el) el.remove();
+}
+
+// ── Anomaly Detection ──────────────────────────────────────────────
+const CONTEXT_API = 'http://localhost:3031';
+
+async function loadAnomalies() {
+  const el = document.getElementById('anomalyContent');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div> Analysing behaviour...</div>';
+
+  const days = document.getElementById('anomalyDays')?.value || 7;
+
+  try {
+    const r = await fetch(`${CONTEXT_API}/anomalies?days=${days}`);
+    if (!r.ok) throw new Error(`Context API returned ${r.status}. Is context-server.py running?`);
+    const d = await r.json();
+    renderAnomalies(d);
+  } catch (e) {
+    el.innerHTML = `
+      <div class="empty">
+        <div class="empty-icon">⚠</div>
+        <div class="empty-title">Could not load anomalies</div>
+        <div class="empty-sub">${e.message}</div>
+      </div>`;
+  }
+}
+
+function renderAnomalies(data) {
+  const el = document.getElementById('anomalyContent');
+  const anomalies = data.anomalies || [];
+
+  if (!anomalies.length) {
+    el.innerHTML = `
+      <div class="empty">
+        <div class="empty-icon">✓</div>
+        <div class="empty-title">No anomalies detected</div>
+        <div class="empty-sub">Today's behaviour looks normal compared to the last ${data.days_compared} days.</div>
+      </div>
+      <div class="anomaly-meta">
+        Compared ${data.total_frames_today?.toLocaleString()} frames today against ${data.days_compared}-day baseline · ${data.date}
+      </div>`;
+    return;
+  }
+
+  const typeIcon = { high: '▲', low: '▼', new: '★' };
+  const typeLabel = { high: 'more than usual', low: 'less than usual', new: 'new app' };
+
+  const cards = anomalies.map(a => {
+    const icon = typeIcon[a.type] || '?';
+    const sub = [];
+    if (a.today !== undefined) sub.push(`today: ${a.today.toLocaleString()} frames`);
+    if (a.avg) sub.push(`avg: ${a.avg.toLocaleString()} frames/day`);
+    if (a.ratio) sub.push(`ratio: ${a.ratio}x`);
+    if (a.pct_of_day) sub.push(`${a.pct_of_day}% of today`);
+    return `
+      <div class="anomaly-card ${a.type}">
+        <div class="anomaly-icon">${icon}</div>
+        <div style="flex:1">
+          <div class="anomaly-msg">${a.message}</div>
+          <div class="anomaly-sub">${sub.map(s => `<span>${s}</span>`).join('')}</div>
+        </div>
+        <div style="font-size:10px;color:var(--dimmer);white-space:nowrap;padding-top:2px">${typeLabel[a.type] || ''}</div>
+      </div>`;
+  }).join('');
+
+  el.innerHTML = `
+    ${cards}
+    <div class="anomaly-meta">
+      ${anomalies.length} anomal${anomalies.length === 1 ? 'y' : 'ies'} found ·
+      Compared ${data.total_frames_today?.toLocaleString()} frames today against ${data.days_compared}-day baseline ·
+      Generated ${new Date(data.generated_at).toLocaleTimeString()}
+    </div>`;
 }
 
 init();
