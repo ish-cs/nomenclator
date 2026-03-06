@@ -755,6 +755,133 @@
   }
 
   .btn.summary:hover { border-color: var(--green); background: var(--green-glow); }
+
+  /* Snapshot button */
+  .btn.snapshot {
+    color: var(--blue);
+    border-color: rgba(77,159,255,0.3);
+  }
+  .btn.snapshot:hover { border-color: var(--blue); background: rgba(77,159,255,0.05); }
+
+  /* ── Timeline tab ── */
+  .timeline-tab {
+    padding: 20px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .timeline-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .timeline-grid {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .timeline-hour-row {
+    display: contents;
+  }
+
+  .timeline-app-label {
+    color: var(--dim);
+    padding: 3px 8px 3px 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    line-height: 22px;
+  }
+
+  .timeline-hours {
+    display: grid;
+    grid-template-columns: repeat(24, 1fr);
+    gap: 2px;
+    height: 22px;
+  }
+
+  .timeline-block {
+    border-radius: 2px;
+    height: 100%;
+    cursor: pointer;
+    transition: opacity 0.15s;
+    position: relative;
+  }
+
+  .timeline-block:hover { opacity: 0.75; }
+
+  .timeline-block.empty {
+    background: var(--border);
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  .timeline-axis {
+    display: grid;
+    grid-template-columns: 120px 1fr;
+    gap: 4px;
+    margin-bottom: 4px;
+  }
+
+  .timeline-axis-hours {
+    display: grid;
+    grid-template-columns: repeat(24, 1fr);
+    gap: 2px;
+    font-size: 9px;
+    color: var(--dimmer);
+  }
+
+  .timeline-axis-hours span {
+    text-align: center;
+  }
+
+  .timeline-detail {
+    margin-top: 8px;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--dim);
+    display: none;
+  }
+
+  .timeline-detail.visible { display: block; }
+  .timeline-detail-title { color: var(--text); font-size: 12px; margin-bottom: 8px; }
+
+  /* Chat clear button */
+  .clear-chat-btn {
+    padding: 6px 12px;
+    background: transparent;
+    border: 1px solid var(--border-bright);
+    border-radius: 4px;
+    color: var(--dimmer);
+    font-family: var(--mono);
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    height: 44px;
+  }
+  .clear-chat-btn:hover { border-color: var(--red); color: var(--red); }
+
+  /* Restored badge */
+  .restored-badge {
+    display: inline-block;
+    font-size: 9px;
+    color: var(--dimmer);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
 </style>
 </head>
 <body>
@@ -814,6 +941,9 @@
         <button class="btn summary" onclick="dailySummary()">
           <span class="btn-icon">◈</span> Today's Summary
         </button>
+        <button class="btn snapshot" onclick="exportContextSnapshot()">
+          <span class="btn-icon">◈</span> Export Context Snapshot
+        </button>
         <button class="btn danger" onclick="confirmStop()">
           <span class="btn-icon">■</span> Stop screenpipe
         </button>
@@ -859,6 +989,7 @@
       <div class="tab" onclick="switchTab('search', this)">Search Results</div>
       <div class="tab" onclick="switchTab('raw', this)">Raw SQL</div>
       <div class="tab" onclick="switchTab('ai', this)">✦ Ask AI</div>
+      <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
       <div class="live-badge" style="margin-left:auto;padding:12px 0">
         <div class="live-dot"></div>
         LIVE
@@ -938,9 +1069,27 @@
             onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();sendAI();}"
             oninput="this.style.height='auto';this.style.height=this.scrollHeight+'px'"></textarea>
         </div>
+        <button class="clear-chat-btn" onclick="clearChat()" title="Clear conversation">↺ Clear</button>
         <button class="send-btn" id="sendBtn" onclick="sendAI()">SEND →</button>
       </div>
 
+    </div>
+
+    <!-- Timeline tab -->
+    <div class="timeline-tab" id="timelineTab" style="display:none">
+      <div class="timeline-header">
+        <div>
+          <div class="section-label">today's app activity · hourly</div>
+        </div>
+        <button class="search-btn" onclick="loadTimeline()" style="font-size:10px;padding:6px 14px">↺ Refresh</button>
+      </div>
+      <div id="timelineContent">
+        <div class="empty">
+          <div class="empty-icon">▦</div>
+          <div class="empty-title">Loading timeline...</div>
+        </div>
+      </div>
+      <div class="timeline-detail" id="timelineDetail"></div>
     </div>
 
   </div>
@@ -1115,12 +1264,184 @@ Based on this data, provide a structured summary with these sections:
   document.getElementById('sendBtn').disabled = false;
 }
 
+// ── Timeline ──────────────────────────────────────────────────────
+function appColor(name) {
+  // Stable hue from app name
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue}, 60%, 45%)`;
+}
+
+async function loadTimeline() {
+  const el = document.getElementById('timelineContent');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div> Loading timeline...</div>';
+  document.getElementById('timelineDetail').classList.remove('visible');
+
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const result = await fetch(`${API}/raw_sql`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ query: `SELECT app_name, strftime('%H', timestamp) as hr, COUNT(*) as cnt FROM frames WHERE date(timestamp)='${today}' AND app_name IS NOT NULL GROUP BY app_name, hr ORDER BY app_name, hr` })
+    }).then(r => r.json()).catch(() => []);
+
+    if (!result || result.length === 0) {
+      el.innerHTML = `<div class="empty">
+        <div class="empty-icon">▦</div>
+        <div class="empty-title">No captures today yet</div>
+        <div class="empty-sub">Screenpipe needs to record some data first.</div>
+      </div>`;
+      return;
+    }
+
+    // Build map: app → { hr → count }
+    const apps = {};
+    let maxCount = 0;
+    for (const row of result) {
+      const app = row.app_name || 'Unknown';
+      if (!apps[app]) apps[app] = {};
+      const cnt = parseInt(row.cnt, 10);
+      apps[app][parseInt(row.hr, 10)] = cnt;
+      if (cnt > maxCount) maxCount = cnt;
+    }
+
+    const sortedApps = Object.keys(apps).sort((a, b) => {
+      const totalA = Object.values(apps[a]).reduce((s, v) => s + v, 0);
+      const totalB = Object.values(apps[b]).reduce((s, v) => s + v, 0);
+      return totalB - totalA;
+    });
+
+    // Axis
+    const axisHours = Array.from({length: 24}, (_, i) => `<span>${i < 10 ? '0'+i : i}</span>`).join('');
+    let html = `
+      <div class="timeline-axis">
+        <div></div>
+        <div class="timeline-axis-hours">${axisHours}</div>
+      </div>
+      <div class="timeline-grid">`;
+
+    for (const app of sortedApps) {
+      const color = appColor(app);
+      const blocks = Array.from({length: 24}, (_, hr) => {
+        const cnt = apps[app][hr] || 0;
+        if (cnt === 0) return `<div class="timeline-block empty" title="${app} ${hr}:00 — no data"></div>`;
+        const opacity = 0.3 + 0.7 * (cnt / maxCount);
+        return `<div class="timeline-block" style="background:${color};opacity:${opacity.toFixed(2)}"
+          title="${app} ${hr}:00 — ${cnt} frames"
+          onclick="showTimelineDetail('${app.replace(/'/g,"\\'")}', ${hr})"></div>`;
+      }).join('');
+
+      html += `
+        <div class="timeline-app-label" title="${app}">${app}</div>
+        <div class="timeline-hours">${blocks}</div>`;
+    }
+    html += '</div>';
+
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<div class="empty"><div class="empty-title">Timeline failed to load</div></div>`;
+  }
+}
+
+async function showTimelineDetail(app, hr) {
+  const detail = document.getElementById('timelineDetail');
+  const today = new Date().toISOString().split('T')[0];
+  const hrPad = hr < 10 ? '0' + hr : hr;
+  detail.classList.add('visible');
+  detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00–${hrPad}:59</div><div class="loading"><div class="spinner"></div> Loading...</div>`;
+
+  try {
+    const rows = await fetch(`${API}/raw_sql`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ query: `SELECT timestamp, window_name, text FROM frames WHERE date(timestamp)='${today}' AND app_name='${app.replace(/'/g,"''")}' AND strftime('%H',timestamp)='${hrPad}' ORDER BY timestamp LIMIT 10` })
+    }).then(r => r.json()).catch(() => []);
+
+    if (!rows || rows.length === 0) {
+      detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00</div><div style="color:var(--dimmer)">No captures</div>`;
+      return;
+    }
+    const items = rows.map(r => {
+      const t = new Date(r.timestamp).toLocaleTimeString();
+      const txt = (r.text || '').slice(0, 120);
+      return `<div style="margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+        <div style="color:var(--dim);font-size:10px;margin-bottom:3px">${t} · ${(r.window_name||'').slice(0,50)}</div>
+        <div style="color:#aaa">${txt}</div>
+      </div>`;
+    }).join('');
+    detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00–${hrPad}:59 (${rows.length} captures shown)</div>${items}`;
+  } catch(e) {
+    detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00</div><div style="color:var(--red)">Failed to load</div>`;
+  }
+}
+
+// ── Context Snapshot Export ────────────────────────────────────────
+async function exportContextSnapshot() {
+  showToast('Building context snapshot...', 'green');
+  try {
+    const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+
+    const [topApps, activeHours, urlCount, audioChunks, sampleText] = await Promise.all([
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT app_name, ROUND(COUNT(*) * 30.0 / 3600, 2) as hours FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' GROUP BY app_name ORDER BY hours DESC LIMIT 10` })
+      }).then(r=>r.json()).catch(()=>[]),
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT strftime('%H', timestamp) as hr, COUNT(*) as cnt FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' GROUP BY hr ORDER BY cnt DESC LIMIT 5` })
+      }).then(r=>r.json()).catch(()=>[]),
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT COUNT(DISTINCT browser_url) as n FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' AND browser_url IS NOT NULL AND browser_url != ''` })
+      }).then(r=>r.json()).catch(()=>[{n:0}]),
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT COUNT(*) as n FROM audio_transcriptions WHERE date(timestamp) >= '${sevenDaysAgo}'` })
+      }).then(r=>r.json()).catch(()=>[{n:0}]),
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT text FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' AND text IS NOT NULL LIMIT 400` })
+      }).then(r=>r.json()).catch(()=>[]),
+    ]);
+
+    // Word frequency for topics
+    const stopWords = new Set(['what','have','been','the','a','an','is','are','was','were','do','did','can','all','on','in','at','to','for','of','and','or','my','your','any','some','this','that','with','from','by','as','it','its','be','has','had','will','would','could','should','just','not','but','so','if','then','than','too','very','also','more','one','two','about','get','new','use','used','into','file']);
+    const freq = {};
+    for (const row of sampleText) {
+      for (const w of (row.text || '').toLowerCase().split(/\W+/)) {
+        if (w.length > 3 && !stopWords.has(w)) {
+          freq[w] = (freq[w] || 0) + 1;
+        }
+      }
+    }
+    const topics = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,30).map(([w])=>w);
+
+    const snapshot = {
+      generated_at: new Date().toISOString(),
+      window_days: 7,
+      profile: {
+        top_apps: (topApps || []).map(r => ({ app: r.app_name, hours: r.hours })),
+        active_hours: (activeHours || []).map(r => parseInt(r.hr, 10)),
+        topics,
+        urls_visited: urlCount?.[0]?.n ?? 0,
+        audio_minutes: Math.round(((audioChunks?.[0]?.n ?? 0) * 30) / 60),
+      }
+    };
+
+    const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `context-snapshot-${new Date().toISOString().split('T')[0]}.json`;
+    a.click();
+    showToast('Snapshot downloaded', 'green');
+  } catch(e) {
+    showToast('Snapshot failed: ' + e.message, 'red');
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────
 async function init() {
   await checkHealth();
   await loadFeed();
   await detectLMStudio();
   loadStorageStats();
+  loadPersistedChat();
   setInterval(checkHealth, 5000);
   setInterval(updateUptime, 1000);
   setInterval(loadStorageStats, 60000); // refresh storage stats every minute
@@ -1338,7 +1659,9 @@ function switchTab(name, el) {
   document.getElementById('searchTab').style.display = name === 'search' ? 'flex' : 'none';
   document.getElementById('rawTab').style.display = name === 'raw' ? 'flex' : 'none';
   document.getElementById('aiTab').style.display = name === 'ai' ? 'flex' : 'none';
+  document.getElementById('timelineTab').style.display = name === 'timeline' ? 'flex' : 'none';
   if (name === 'ai') setTimeout(() => document.getElementById('aiInput').focus(), 100);
+  if (name === 'timeline') loadTimeline();
 }
 
 // ── Auto refresh ──────────────────────────────────────────────────
@@ -1564,7 +1887,11 @@ async function sendAI() {
   document.getElementById('aiInput').focus();
 }
 
-function appendMsg(role, text) {
+const CHAT_STORAGE_KEY = 'augur_chat';
+const CHAT_MAX_MESSAGES = 50;
+let _suppressPersist = false; // set true during loadPersistedChat to avoid re-saving
+
+function appendMsg(role, text, restored = false) {
   const msgs = document.getElementById('aiMessages');
   const time = new Date().toLocaleTimeString();
   const isUser = role === 'user';
@@ -1577,11 +1904,55 @@ function appendMsg(role, text) {
   div.innerHTML = `
     <div class="msg-avatar">${isUser ? 'you' : 'AI'}</div>
     <div>
-      <div class="msg-bubble">${formatted}</div>
+      <div class="msg-bubble">${formatted}${restored ? '<span class="restored-badge">restored</span>' : ''}</div>
       <div class="msg-time">${time}</div>
     </div>`;
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
+
+  // Persist to localStorage (skip during load to avoid duplication)
+  if (!_suppressPersist) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || '[]');
+      stored.push({ role, text, time });
+      if (stored.length > CHAT_MAX_MESSAGES) stored.splice(0, stored.length - CHAT_MAX_MESSAGES);
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(stored));
+    } catch(e) {}
+  }
+}
+
+function loadPersistedChat() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || '[]');
+    if (!stored.length) return;
+    const msgs = document.getElementById('aiMessages');
+    msgs.innerHTML = '';
+    document.getElementById('suggestions').style.display = 'none';
+    _suppressPersist = true;
+    stored.forEach((m, i) => appendMsg(m.role, m.text, i === 0));
+    _suppressPersist = false;
+  } catch(e) {
+    _suppressPersist = false;
+  }
+}
+
+function clearChat() {
+  if (!confirm('Clear conversation history?')) return;
+  localStorage.removeItem(CHAT_STORAGE_KEY);
+  chatHistory = [];
+  const msgs = document.getElementById('aiMessages');
+  msgs.innerHTML = `<div class="msg ai">
+    <div class="msg-avatar">AI</div>
+    <div>
+      <div class="msg-bubble">
+        Hey — I can answer questions about what screenpipe has captured on your screen.<br><br>
+        Try asking <strong>"What have I been working on today?"</strong> or just ask me anything general.
+      </div>
+      <div class="msg-time">now</div>
+    </div>
+  </div>`;
+  document.getElementById('suggestions').style.display = 'flex';
+  showToast('Chat cleared', 'green');
 }
 
 function showTyping() {
