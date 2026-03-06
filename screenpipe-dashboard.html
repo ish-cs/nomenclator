@@ -1034,6 +1034,7 @@
       <div class="tab" onclick="switchTab('ai', this)">✦ Ask AI</div>
       <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
       <div class="tab" onclick="switchTab('anomalies', this)">Anomalies</div>
+      <div class="tab" onclick="switchTab('browser', this)">Browser</div>
       <div class="live-badge" style="margin-left:auto;padding:12px 0">
         <div class="live-dot"></div>
         LIVE
@@ -1051,10 +1052,17 @@
 
     <!-- Search tab -->
     <div class="feed" id="searchTab" style="display:none">
-      <div class="empty">
-        <div class="empty-icon">⌕</div>
-        <div class="empty-title">Search your screen history</div>
-        <div class="empty-sub">Type anything above and hit SEARCH.<br>Screenpipe has OCR'd everything on your screen.</div>
+      <div class="search-mode-row">
+        <button id="modeKeyword"  class="mode-btn active" onclick="setSearchMode('keyword')">Keyword</button>
+        <button id="modeSemantic" class="mode-btn"         onclick="setSearchMode('semantic')">Semantic</button>
+        <span id="searchModeHint" class="mode-hint"></span>
+      </div>
+      <div id="searchResults">
+        <div class="empty">
+          <div class="empty-icon">⌕</div>
+          <div class="empty-title">Search your screen history</div>
+          <div class="empty-sub">Type anything above and hit SEARCH.<br>Screenpipe has OCR'd everything on your screen.</div>
+        </div>
       </div>
     </div>
 
