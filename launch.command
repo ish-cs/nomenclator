@@ -30,6 +30,8 @@ LM_STUDIO_PORT   = 1234
 CHECK_RETRIES    = 10
 RETRY_DELAY      = 1.5  # seconds
 CLEANUP_DAYS     = 7    # delete raw screenpipe files older than this many days
+SEMANTIC_INDEXER  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "semantic_search.py")
+SEMANTIC_PID_FILE = os.path.expanduser("~/.screenpipe/semantic_indexer.pid")
 
 # ── Helpers ─────────────────────────────────────────────────────────
 def is_port_open(port):
@@ -74,6 +76,57 @@ def print_header():
     print("  │         screenpipe launcher          │")
     print("  └─────────────────────────────────────┘")
     print()
+
+def is_semantic_available():
+    """Check if chromadb and sentence_transformers are importable."""
+    import importlib
+    try:
+        importlib.import_module('chromadb')
+        importlib.import_module('sentence_transformers')
+        return True
+    except ImportError:
+        return False
+
+
+def is_semantic_running():
+    """Check if the semantic indexer daemon is alive via PID file."""
+    if not os.path.exists(SEMANTIC_PID_FILE):
+        return False
+    try:
+        with open(SEMANTIC_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)   # signal 0 = existence check only
+        return True
+    except (ValueError, ProcessLookupError, PermissionError, OSError):
+        # PID file stale — clean it up
+        try:
+            os.unlink(SEMANTIC_PID_FILE)
+        except Exception:
+            pass
+        return False
+
+
+def start_semantic_indexer():
+    """Start semantic_search.py daemon. Returns (True, pid) or (False, reason)."""
+    if not os.path.exists(SEMANTIC_INDEXER):
+        return False, "semantic_search.py not found"
+    if not is_semantic_available():
+        return False, "deps missing (pip install chromadb sentence-transformers)"
+    try:
+        log_file = open(os.path.expanduser("~/.screenpipe/launcher.log"), "a")
+        proc = subprocess.Popen(
+            [sys.executable, SEMANTIC_INDEXER],
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
+        )
+        os.makedirs(os.path.dirname(SEMANTIC_PID_FILE), exist_ok=True)
+        with open(SEMANTIC_PID_FILE, 'w') as f:
+            f.write(str(proc.pid))
+        return True, proc.pid
+    except Exception as e:
+        return False, str(e)
+
 
 # ── Main ─────────────────────────────────────────────────────────────
 def main():
@@ -147,7 +200,30 @@ def main():
     else:
         print_status("context-server.py not found — skipping Context API", ok=False)
 
-    # 4. Check LM Studio
+    # 4. Start semantic indexer
+    print()
+    if is_semantic_running():
+        print_status("Semantic indexer already running")
+    elif not is_semantic_available():
+        print_status("Semantic indexer not available (pip install chromadb sentence-transformers)", ok=False)
+        print()
+        print("  To enable semantic context search:")
+        print("    pip install chromadb sentence-transformers")
+    elif not os.path.exists(SEMANTIC_INDEXER):
+        print_status("semantic_search.py not found — skipping semantic indexer", ok=False)
+    else:
+        print("  ⟳  Starting Augur Semantic Indexer...")
+        ok, info = start_semantic_indexer()
+        if ok:
+            time.sleep(1.5)
+            if is_semantic_running():
+                print_status(f"Semantic indexer started (PID {info})")
+            else:
+                print_status("Semantic indexer starting (model loading, may take a minute)", ok=True)
+        else:
+            print_status(f"Failed to start semantic indexer: {info}", ok=False)
+
+    # 5. Check LM Studio
     print()
     if is_port_open(LM_STUDIO_PORT):
         print_status("LM Studio server running on port 1234")
@@ -161,7 +237,7 @@ def main():
         print()
         print("  Dashboard will still open -- AI chat will work once server is running.")
 
-    # 5. Check dashboard file
+    # 6. Check dashboard file
     print()
     if not os.path.exists(DASHBOARD_PATH):
         print_status(f"Dashboard file not found: {DASHBOARD_PATH}", ok=False)
@@ -171,7 +247,7 @@ def main():
 
     print_status(f"Dashboard found")
 
-    # 6. Open browser
+    # 7. Open browser
     print()
     print("  ⟳  Opening dashboard in browser...")
     time.sleep(0.5)
@@ -189,10 +265,16 @@ def main():
     try:
         while True:
             time.sleep(10)
-            sp = is_port_open(SCREENPIPE_PORT)
+            sp  = is_port_open(SCREENPIPE_PORT)
             ctx = is_port_open(CONTEXT_PORT)
-            lm = is_port_open(LM_STUDIO_PORT)
-            status = f"  [screenpipe: {'up' if sp else 'DOWN'}]  [context-api: {'up' if ctx else 'down'}]  [LM Studio: {'up' if lm else 'not running'}]"
+            sem = is_semantic_running()
+            lm  = is_port_open(LM_STUDIO_PORT)
+            status = (
+                f"  [screenpipe: {'up' if sp else 'DOWN'}]"
+                f"  [context-api: {'up' if ctx else 'down'}]"
+                f"  [semantic: {'up' if sem else 'down'}]"
+                f"  [LM Studio: {'up' if lm else 'not running'}]"
+            )
             print(f"\r{status}    ", end="", flush=True)
     except KeyboardInterrupt:
         print("\n\n  Launcher closed. Screenpipe continues running in background.")

@@ -4,3 +4,7 @@
 # Semantic search (vector store + embeddings)
 chromadb>=0.4.0
 sentence-transformers>=2.2.0
+
+# Optional LLM backends for demo_agent.py (--api flag):
+# pip install anthropic    → Claude API  (set ANTHROPIC_API_KEY)
+# pip install openai       → OpenAI API  (set OPENAI_API_KEY, optional OPENAI_MODEL)

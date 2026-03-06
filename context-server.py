@@ -8,6 +8,8 @@ Endpoints:
   GET /health                        — status check
   GET /context?q=...&limit=N&window_hours=H  — ranked context for a query
   GET /summary?date=YYYY-MM-DD       — structured daily summary
+  GET /profile?days=7                — behavioral profile
+  GET /context-card?days=7           — compact natural language profile card
 
 Usage: python context-server.py
 """
@@ -38,6 +40,11 @@ STOP_WORDS = frozenset([
     'just','get','got','show','find','give','let','now','up','down',
     'not','no','yes','but','so','if','then','than','too','very',
 ])
+
+# ── Semantic cache (loaded once, reused across requests) ─────────────
+_semantic_embedder   = None   # SentenceTransformer instance or None
+_semantic_collection = None   # Chroma collection or None
+_semantic_available  = None   # None = untested | True | False
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -79,6 +86,54 @@ def cors_headers():
     }
 
 
+# ── Semantic helpers ─────────────────────────────────────────────────
+def _try_load_semantic():
+    """
+    Attempt to load the Chroma collection and sentence-transformer embedder.
+    Caches result in module globals so this only pays the load cost once.
+    Returns True if semantic scoring is available, False otherwise.
+    """
+    global _semantic_embedder, _semantic_collection, _semantic_available
+    if _semantic_available is not None:
+        return _semantic_available
+    try:
+        import semantic_search as ss
+        client = ss.get_client()
+        col    = ss.get_collection(client)
+        if col.count() == 0:
+            _semantic_available = False
+            return False
+        embedder = ss.get_embedder()
+        _semantic_collection = col
+        _semantic_embedder   = embedder
+        _semantic_available  = True
+        return True
+    except Exception:
+        _semantic_available = False
+        return False
+
+
+def _get_semantic_scores(query, n):
+    """
+    Return {uid_str: cosine_similarity} for top-n semantic matches.
+    Returns empty dict if index unavailable or query fails.
+    UIDs are string frame_ids as stored in Chroma.
+    """
+    if not _semantic_available or _semantic_embedder is None:
+        return {}
+    try:
+        import semantic_search as ss
+        result = ss.semantic_query(
+            query,
+            n_results=n,
+            embedder=_semantic_embedder,
+            collection=_semantic_collection,
+        )
+        return {str(r['id']): r['score'] for r in result.get('results', [])}
+    except Exception:
+        return {}
+
+
 # ── Browser captures storage ─────────────────────────────────────────
 _browser_captures = []   # in-memory list, loaded from file on start
 
@@ -109,6 +164,51 @@ def save_browser_capture(entry):
 
 def get_browser_captures(limit=50):
     return list(reversed(_browser_captures[-limit:]))
+
+
+def browser_capture_to_candidate(cap):
+    """Convert a browser capture entry into a pseudo-item compatible with gather_context scoring."""
+    url    = cap.get('url', '') or ''
+    domain = cap.get('domain', '') or ''
+    title  = cap.get('title', '') or ''
+    selected = cap.get('selected_text', '') or ''
+    ts     = cap.get('timestamp') or cap.get('received_at', '') or ''
+    time_s = int(cap.get('time_on_page_s') or 0)
+    scroll = int(cap.get('scroll_depth_pct') or 0)
+
+    # Searchable blob: all text fields lowercased
+    blob = ' '.join(filter(None, [
+        title.lower(),
+        domain.lower(),
+        url[:200].lower(),
+        selected[:400].lower(),
+    ]))
+
+    # Stable UID: browser_ prefix guarantees no collision with integer frame_ids
+    try:
+        minute = ts[:16]  # "2026-03-05T14:23"
+    except Exception:
+        minute = ts
+    uid = f"browser_{abs(hash(url + minute)) % (10 ** 9)}"
+
+    return {
+        '_source': 'browser',
+        '_blob': blob,
+        '_timestamp': ts,
+        '_uid': uid,
+        '_time_on_page_s': time_s,
+        '_scroll_pct': scroll,
+        '_has_selection': bool(selected and len(selected.strip()) > 10),
+        '_result': {
+            'frame_id': uid,
+            'timestamp': ts,
+            'app': 'Browser',
+            'window': (title[:120] if title else url[:120]),
+            'text': (selected[:300] if selected else (title or url[:150])),
+            'url': url,
+            'source': 'browser',
+        },
+    }
 
 
 # ── Anomaly detection ────────────────────────────────────────────────
@@ -210,49 +310,101 @@ def gather_context(query, limit, window_hours):
             seen.add(uid)
             all_items.append(item)
 
-    # Score: keyword_matches * 3 + recency
+    # ── Merge browser captures ───────────────────────────────────────
+    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff_dt = now_dt - timedelta(seconds=window_hours * 3600)
+    for cap in _browser_captures:
+        ts_str = cap.get('timestamp') or cap.get('received_at', '')
+        try:
+            cap_dt = datetime.fromisoformat(
+                ts_str.replace('Z', '+00:00').replace('+00:00', '')
+            )
+            if cap_dt < cutoff_dt:
+                continue
+        except Exception:
+            continue  # skip captures with unparseable timestamps
+        cand = browser_capture_to_candidate(cap)
+        uid = cand['_uid']
+        if uid not in seen:
+            seen.add(uid)
+            all_items.append(cand)
+
+    # Attempt semantic bonus — transparent no-op if unavailable
+    _try_load_semantic()
+    semantic_scores = _get_semantic_scores(query, min(limit * 3, 60))
+    semantic_active = bool(semantic_scores)
+
+    # Score: keyword_matches * 3 + recency (+ semantic bonus for OCR/audio)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     window_ms = window_hours * 3600
     for item in all_items:
-        c = item.get('content', {})
-        blob = ' '.join([
-            c.get('text', '') or '',
-            c.get('transcription', '') or '',
-            c.get('app_name', '') or '',
-            c.get('window_name', '') or '',
-        ]).lower()
-        kw_score = sum(
-            min(blob.count(kw), 5) for kw in keywords
-        )
-        try:
-            ts = datetime.fromisoformat(c.get('timestamp', '').replace('Z', '+00:00').replace('+00:00', ''))
-            age_s = (now - ts).total_seconds()
-        except Exception:
-            age_s = window_ms
-        recency = max(0.0, 1.0 - age_s / window_ms) if window_ms > 0 else 0.0
-        item['_score'] = kw_score * 3 + recency
+        if item.get('_source') == 'browser':
+            blob = item['_blob']
+            kw_score = sum(min(blob.count(kw), 5) for kw in keywords)
+            try:
+                ts = datetime.fromisoformat(
+                    item['_timestamp'].replace('Z', '+00:00').replace('+00:00', ''))
+                age_s = (now - ts).total_seconds()
+            except Exception:
+                age_s = window_ms
+            recency   = max(0.0, 1.0 - age_s / window_ms) if window_ms > 0 else 0.0
+            time_bon  = min(item['_time_on_page_s'] / 300.0, 1.0)
+            sel_bon   = 2.0 if item['_has_selection'] else 0.0
+            item['_score'] = kw_score * 3 + recency + time_bon + sel_bon
+        else:
+            # Existing OCR/audio scoring
+            c = item.get('content', {})
+            blob = ' '.join([
+                c.get('text', '') or '',
+                c.get('transcription', '') or '',
+                c.get('app_name', '') or '',
+                c.get('window_name', '') or '',
+            ]).lower()
+            kw_score = sum(min(blob.count(kw), 5) for kw in keywords)
+            try:
+                ts = datetime.fromisoformat(
+                    c.get('timestamp', '').replace('Z', '+00:00').replace('+00:00', ''))
+                age_s = (now - ts).total_seconds()
+            except Exception:
+                age_s = window_ms
+            recency = max(0.0, 1.0 - age_s / window_ms) if window_ms > 0 else 0.0
+            # Semantic bonus: cosine similarity * 2.0 (range 0-2)
+            uid_key = str(c.get('frame_id') or c.get('timestamp') or '')
+            sem_bonus = semantic_scores.get(uid_key, 0.0) * 2.0
+            item['_score'] = kw_score * 3 + recency + sem_bonus
 
     all_items.sort(key=lambda x: x.get('_score', 0), reverse=True)
     top = all_items[:limit]
 
     results = []
     for item in top:
-        c = item.get('content', {})
-        is_ocr = item.get('type') == 'OCR'
-        results.append({
-            'frame_id': c.get('frame_id'),
-            'timestamp': c.get('timestamp'),
-            'app': c.get('app_name') if is_ocr else None,
-            'window': c.get('window_name') if is_ocr else None,
-            'text': (c.get('text') if is_ocr else c.get('transcription')) or '',
-            'url': c.get('browser_url'),
-            'score': round(item.get('_score', 0), 3),
-        })
+        if item.get('_source') == 'browser':
+            results.append({
+                **item['_result'],
+                'score': round(item.get('_score', 0), 3),
+            })
+        else:
+            c = item.get('content', {})
+            is_ocr = item.get('type') == 'OCR'
+            results.append({
+                'frame_id': c.get('frame_id'),
+                'timestamp': c.get('timestamp'),
+                'app': c.get('app_name') if is_ocr else None,
+                'window': c.get('window_name') if is_ocr else None,
+                'text': (c.get('text') if is_ocr else c.get('transcription')) or '',
+                'url': c.get('browser_url'),
+                'score': round(item.get('_score', 0), 3),
+                'source': 'ocr' if is_ocr else 'audio',
+            })
 
     return {
         'query': query,
         'keywords': keywords,
         'total_candidates': len(all_items),
+        'browser_captures_included': sum(
+            1 for i in all_items if i.get('_source') == 'browser'
+        ),
+        'semantic_enhanced': semantic_active,
         'results': results,
         'generated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
     }
@@ -309,6 +461,166 @@ def get_summary(date_str):
             'audio_chunks': audio_count[0].get('n', 0) if audio_count else 0,
         }
     }, None
+
+
+# ── Profile endpoints ─────────────────────────────────────────────────
+def get_profile(days=7):
+    """Rich behavioral profile over the last N days."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+    top_apps = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT app_name, COUNT(*) as frames FROM frames "
+            f"WHERE date(timestamp) >= '{start}' AND app_name IS NOT NULL "
+            f"AND app_name != '' GROUP BY app_name ORDER BY frames DESC LIMIT 10"
+        )
+    }) or []
+
+    hourly = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT CAST(strftime('%H', timestamp) AS INTEGER) as hr, "
+            f"COUNT(*) as cnt FROM frames "
+            f"WHERE date(timestamp) >= '{start}' GROUP BY hr ORDER BY hr"
+        )
+    }) or []
+
+    url_rows = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT browser_url, COUNT(*) as visits FROM frames "
+            f"WHERE date(timestamp) >= '{start}' AND browser_url IS NOT NULL "
+            f"AND browser_url != '' GROUP BY browser_url "
+            f"ORDER BY visits DESC LIMIT 100"
+        )
+    }) or []
+
+    sample_text = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT text FROM frames WHERE date(timestamp) >= '{start}' "
+            f"AND text IS NOT NULL LIMIT 500"
+        )
+    }) or []
+
+    total_frames = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT COUNT(*) as n FROM frames WHERE date(timestamp) >= '{start}'"
+        )
+    }) or [{'n': 0}]
+
+    audio_count = post_json(f"{SCREENPIPE_URL}/raw_sql", {
+        'query': (
+            f"SELECT COUNT(*) as n FROM audio_transcriptions "
+            f"WHERE date(timestamp) >= '{start}'"
+        )
+    }) or [{'n': 0}]
+
+    # Top apps with approximate hours (screenpipe ~1 frame/sec)
+    app_list = []
+    for r in top_apps:
+        frames = int(r.get('frames', 0))
+        app_list.append({
+            'app': r.get('app_name'),
+            'frames': frames,
+            'hours': round(frames / 3600, 2),
+        })
+
+    # 24-slot hourly heatmap
+    heatmap = [0] * 24
+    for r in hourly:
+        try:
+            heatmap[int(r.get('hr', 0))] = int(r.get('cnt', 0))
+        except Exception:
+            pass
+
+    # Domain frequency
+    domain_counts = defaultdict(int)
+    for r in url_rows:
+        url = r.get('browser_url', '') or ''
+        try:
+            parsed = urllib.parse.urlparse(url)
+            domain = parsed.netloc
+            if domain:
+                domain_counts[domain] += int(r.get('visits', 0))
+        except Exception:
+            pass
+    top_domains = [
+        {'domain': d, 'visits': c}
+        for d, c in sorted(domain_counts.items(), key=lambda x: -x[1])[:10]
+    ]
+
+    # Topic extraction
+    word_freq = defaultdict(int)
+    for row in sample_text:
+        for w in (row.get('text', '') or '').lower().split():
+            w = ''.join(c for c in w if c.isalpha())
+            if len(w) > 3 and w not in STOP_WORDS:
+                word_freq[w] += 1
+    top_topics = [w for w, _ in sorted(word_freq.items(), key=lambda x: -x[1])[:25]]
+
+    # Browser captures in window
+    browser_in_window = sum(
+        1 for cap in _browser_captures
+        if (cap.get('timestamp') or cap.get('received_at', ''))[:10] >= start
+    )
+
+    return {
+        'generated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'window_days': days,
+        'date_range': {'start': start, 'end': today},
+        'profile': {
+            'total_frames':       int(total_frames[0].get('n', 0) if total_frames else 0),
+            'total_audio_chunks': int(audio_count[0].get('n', 0) if audio_count else 0),
+            'browser_captures':   browser_in_window,
+            'top_apps':           app_list,
+            'active_hours':       {'heatmap': heatmap},
+            'top_domains':        top_domains,
+            'top_topics':         top_topics,
+        },
+    }
+
+
+def get_context_card(days=7):
+    """
+    Ultra-compact natural language profile (~300-500 chars).
+    Designed to be prepended to any LLM system prompt for instant personalization.
+    """
+    data = get_profile(days)
+    p    = data.get('profile', {})
+
+    apps     = p.get('top_apps', [])
+    topics   = p.get('top_topics', [])
+    domains  = p.get('top_domains', [])
+    heatmap  = p.get('active_hours', {}).get('heatmap', [])
+
+    top_app_names = ', '.join(a['app'] for a in apps[:3] if a.get('app'))
+
+    if heatmap and max(heatmap, default=0) > 0:
+        peak_hours = ', '.join(
+            f"{h}:00"
+            for h in sorted(range(24), key=lambda h: -heatmap[h])[:3]
+        )
+    else:
+        peak_hours = 'unknown'
+
+    top_topic_words  = ', '.join(topics[:8])
+    top_domain_names = ', '.join(d['domain'] for d in domains[:3])
+
+    parts = [f"User profile (last {days} days):"]
+    if top_app_names:
+        parts.append(f"Primarily uses {top_app_names}.")
+    parts.append(f"Most active at {peak_hours}.")
+    if top_topic_words:
+        parts.append(f"Recent topics: {top_topic_words}.")
+    if top_domain_names:
+        parts.append(f"Frequent sites: {top_domain_names}.")
+
+    card = ' '.join(parts)
+    return {
+        'card':         card,
+        'chars':        len(card),
+        'window_days':  days,
+        'generated_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+    }
 
 
 # ── HTTP Handler ─────────────────────────────────────────────────────
@@ -398,10 +710,19 @@ class ContextHandler(BaseHTTPRequestHandler):
                 'results': get_browser_captures(limit),
             })
 
+        elif parsed.path == '/profile':
+            days = int(p('days', 7))
+            self.send_json(200, get_profile(days))
+
+        elif parsed.path == '/context-card':
+            days = int(p('days', 7))
+            self.send_json(200, get_context_card(days))
+
         else:
             self.send_json(404, {'error': 'not found', 'endpoints': [
                 '/health', '/context', '/summary', '/anomalies',
-                '/semantic', '/browser-captures', 'POST /browser-capture',
+                '/semantic', '/browser-captures', '/profile', '/context-card',
+                'POST /browser-capture',
             ]})
 
     def do_POST(self):
@@ -426,7 +747,7 @@ def main():
 
     print()
     print("  ┌─────────────────────────────────────┐")
-    print("  │       Augur Context API v0.2         │")
+    print("  │       Augur Context API v0.3         │")
     print("  │       localhost:3031                 │")
     print("  └─────────────────────────────────────┘")
     print()
@@ -442,6 +763,13 @@ def main():
     except ImportError:
         print("  -  semantic search: not available (pip install chromadb sentence-transformers)")
 
+    # Attempt to warm up semantic scoring
+    _try_load_semantic()
+    if _semantic_available:
+        print("  v  semantic scoring: active (hybrid mode)")
+    else:
+        print("  -  semantic scoring: inactive (index empty or deps missing)")
+
     print()
     print("  Endpoints:")
     print("    GET  /health")
@@ -450,6 +778,8 @@ def main():
     print("    GET  /anomalies?days=7")
     print("    GET  /semantic?q=...&limit=15")
     print("    GET  /browser-captures?limit=50")
+    print("    GET  /profile?days=7")
+    print("    GET  /context-card?days=7")
     print("    POST /browser-capture  (JSON body)")
     print()
     print("  Press Ctrl+C to stop.")
