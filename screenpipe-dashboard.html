@@ -1297,12 +1297,12 @@ async function dailySummary() {
   try {
     const today = new Date().toISOString().split('T')[0];
 
-    const [_searchRes, appBreakdown] = await Promise.all([
-      fetch(`${API}/search?content_type=ocr&limit=60&start_time=${encodeURIComponent(today + 'T00:00:00')}`).then(r=>r.json()).catch(()=>({data:[]})),
+    const [todayFrames, appBreakdown] = await Promise.all([
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT f.app_name, f.window_name, ot.text, f.timestamp FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp) = '${today}' ORDER BY f.timestamp DESC LIMIT 60` }) }).then(r=>r.json()).catch(()=>[]),
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ query: `SELECT app_name, COUNT(*) as cnt FROM frames WHERE date(timestamp) = '${today}' GROUP BY app_name ORDER BY cnt DESC LIMIT 10` }) }).then(r=>r.json()).catch(()=>[])
     ]);
-    const todayFrames = (_searchRes.data || []).filter(x => x.type === 'OCR').map(x => x.content);
 
     if (!todayFrames || todayFrames.length === 0) {
       removeTyping();
@@ -1456,13 +1456,11 @@ async function showTimelineDetail(app, hr) {
   detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00–${hrPad}:59</div><div class="loading"><div class="spinner"></div> Loading...</div>`;
 
   try {
-    const _d = await fetch(
-      `${API}/search?content_type=ocr&limit=10` +
-      `&start_time=${encodeURIComponent(today + 'T' + hrPad + ':00:00')}` +
-      `&end_time=${encodeURIComponent(today + 'T' + hrPad + ':59:59')}` +
-      `&app_name=${encodeURIComponent(app)}`
-    ).then(r => r.json()).catch(() => null);
-    const rows = (_d?.data || []).filter(x => x.type === 'OCR' && x.content.app_name === app).map(x => x.content);
+    const rows = await fetch(`${API}/raw_sql`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ query: `SELECT f.timestamp, f.window_name, ot.text FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp)='${today}' AND f.app_name='${app.replace(/'/g,"''")}' AND strftime('%H',f.timestamp)='${hrPad}' ORDER BY f.timestamp LIMIT 10` })
+    }).then(r => r.json()).catch(() => []);
 
     if (!rows || rows.length === 0) {
       detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00</div><div style="color:var(--dimmer)">No captures</div>`;
@@ -1501,8 +1499,9 @@ async function exportContextSnapshot() {
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ query: `SELECT COUNT(*) as n FROM audio_transcriptions WHERE date(timestamp) >= '${sevenDaysAgo}'` })
       }).then(r=>r.json()).catch(()=>[{n:0}]),
-      fetch(`${API}/search?content_type=ocr&limit=400&start_time=${encodeURIComponent(sevenDaysAgo + 'T00:00:00')}`)
-        .then(r=>r.json()).then(d=>(d.data||[]).filter(x=>x.type==='OCR').map(x=>({text:x.content.text}))).catch(()=>[]),
+      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ query: `SELECT ot.text FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp) >= '${sevenDaysAgo}' AND ot.text IS NOT NULL LIMIT 400` })
+      }).then(r=>r.json()).catch(()=>[]),
     ]);
 
     // Word frequency for topics
