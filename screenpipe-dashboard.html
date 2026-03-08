@@ -1908,16 +1908,15 @@ let loadedModel = null; // set dynamically from /v1/models
 let aiContext = 'none';
 let chatHistory = [];
 let isThinking = false;
-let userProfileCard = null;
+let userProfileCard = '';
 
 async function loadUserProfileCard() {
   try {
-    const r = await fetch('http://localhost:3031/context-card?days=7', { signal: AbortSignal.timeout(3000) });
-    if (!r.ok) throw new Error('context-server unavailable');
+    const r = await fetch('http://localhost:3031/context-card?days=7');
     const d = await r.json();
-    userProfileCard = d.card || null;
-  } catch(e) {
-    userProfileCard = null;
+    if (d.card) userProfileCard = d.card;
+  } catch (e) {
+    userProfileCard = '';
   }
 }
 
@@ -1950,89 +1949,58 @@ function askSuggestion(el) {
 
 async function getScreenpipeContext(question) {
   try {
-    const stopWords = new Set(['what','have','i','been','the','a','an','is','are','was','were','do','did','can','tell','me','all','about','on','in','at','to','for','of','and','or','my','your','any','some','this','that','how','when','where','who','why','which','with','from','by','as','it','its','be','has','had','will','would','could','should']);
-    const keywords = question.toLowerCase()
-      .replace(/[^a-z0-9 ]/g, ' ')
-      .split(' ')
-      .filter(w => w.length > 2 && !stopWords.has(w))
-      .slice(0, 5);
+    // Primary: use context-server.py hybrid ranking (keyword + semantic + browser)
+    const ctxResp = await fetch(
+      `http://localhost:3031/context?q=${encodeURIComponent(question)}&limit=12&window_hours=24`
+    ).then(r => r.json()).catch(() => null);
 
-    let contextChunks = [];
-    let fallback = false;
+    let frames = [];
 
-    // Try context-server on port 3031 first
-    try {
-      const ctxResp = await fetch(
-        `http://localhost:3031/context?q=${encodeURIComponent(question)}&limit=20`,
-        { signal: AbortSignal.timeout(3000) }
-      );
-      if (!ctxResp.ok) throw new Error('context-server error');
-      const ctxData = await ctxResp.json();
-      const results = ctxData.results || [];
-      contextChunks = results.map(item => {
-        const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '';
-        const app = item.app || item.url || 'unknown';
-        const win = item.window ? ` / ${item.window.slice(0, 40)}` : '';
-        const text = (item.text || '').slice(0, 400);
-        const source = (item.source || 'ocr').toUpperCase();
-        return `[${time}] [${source}: ${app}${win}]\n${text}`;
+    if (ctxResp && ctxResp.results && ctxResp.results.length > 0) {
+      // Use hybrid-ranked results from context-server.py
+      frames = ctxResp.results.map(r => {
+        const time = r.timestamp ? new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+        const src  = r.source === 'browser' ? `Browser / ${(r.window || r.url || '').slice(0, 60)}` : `${r.app || '?'} / ${(r.window || '').slice(0, 50)}`;
+        const text = (r.text || '').slice(0, 400);
+        return `[${time}] [${src}]\n${text}`;
       });
-    } catch(e) {
-      // Fallback: direct screenpipe on port 3030
-      fallback = true;
-      const recentFetch = fetch(`${API}/search?limit=20`).then(r => r.json()).catch(() => ({data:[]}));
-      const keywordFetches = keywords.map(kw =>
-        fetch(`${API}/search?q=${encodeURIComponent(kw)}&limit=10`).then(r => r.json()).catch(() => ({data:[]}))
-      );
-      const [recent, ...kwResults] = await Promise.all([recentFetch, ...keywordFetches]);
-      const seen = new Set();
-      const allItems = [];
-      for (const result of [recent, ...kwResults]) {
-        for (const item of (result.data || [])) {
-          const id = item.content?.frame_id || item.content?.timestamp;
-          if (id && !seen.has(id)) { seen.add(id); allItems.push(item); }
-        }
-      }
-      if (allItems.length > 0) {
-        const now = Date.now();
-        const maxAge = 24 * 60 * 60 * 1000;
-        allItems.forEach(item => {
-          const c = item.content;
-          const blob = [c.text||'', c.transcription||'', c.app_name||'', c.window_name||''].join(' ').toLowerCase();
-          const kwScore = keywords.reduce((s, kw) => s + Math.min((blob.match(new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'))||[]).length, 5), 0);
-          const age = now - new Date(c.timestamp || 0);
-          item._score = kwScore * 3 + Math.max(0, 1 - age / maxAge);
-        });
-        allItems.sort((a, b) => b._score - a._score);
-        contextChunks = allItems.slice(0, 20).map(item => {
-          const c = item.content;
-          const isOCR = item.type === 'OCR';
-          const time = new Date(c.timestamp).toLocaleTimeString();
-          const text = (isOCR ? c.text : c.transcription) || '';
-          const app = isOCR ? `${c.app_name} / ${(c.window_name||'').slice(0,40)}` : 'audio';
-          return `[${time}] [${app}]\n${text.slice(0, 400)}`;
-        });
-      }
+    } else {
+      // Fallback: direct screenpipe (context-server offline)
+      const recent = await fetch(`${API}/search?limit=20`).then(r => r.json()).catch(() => ({ data: [] }));
+      const allItems = recent.data || [];
+      allItems.sort((a, b) => new Date(b.content?.timestamp || 0) - new Date(a.content?.timestamp || 0));
+      frames = allItems.slice(0, 12).map(item => {
+        const c = item.content;
+        const time = c.timestamp ? new Date(c.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+        const isOCR = item.type === 'OCR';
+        const src = isOCR ? `${c.app_name || '?'} / ${(c.window_name || '').slice(0, 50)}` : 'audio';
+        const text = ((isOCR ? c.text : c.transcription) || '').slice(0, 400);
+        return `[${time}] [${src}]\n${text}`;
+      });
     }
 
-    if (contextChunks.length === 0) return { context: '', fallback };
-
-    // Dynamic context budget trimming: target ~5000 chars
-    const BUDGET = 5000;
-    const separator = '\n\n---\n\n';
-    const trimmed = [];
-    let total = 0;
-    for (const chunk of contextChunks) {
-      if (total + chunk.length + separator.length > BUDGET) break;
-      trimmed.push(chunk);
-      total += chunk.length + separator.length;
+    if (frames.length === 0) {
+      return '\n\n[No recent screen data available for this query.]';
     }
-    if (trimmed.length === 0) trimmed.push(contextChunks[0].slice(0, BUDGET));
-    const contextText = trimmed.join(separator);
 
-    const header = `\n\nScreen capture context (${contextChunks.length} captures, showing ${trimmed.length}):\n\n`;
-    return { context: header + contextText, fallback };
-  } catch(e) { return { context: '', fallback: false }; }
+    // Dynamic budget: leave room for chat history + response
+    const historyChars = chatHistory.slice(-6).reduce((n, m) => n + (m.content || '').length, 0);
+    const budget = Math.max(1500, Math.min(4000, 5500 - historyChars));
+
+    const label = ctxResp?.keywords?.join(', ') || question.slice(0, 60);
+    const statusLabel = ctxResp ? label : `${label} (fallback mode — context server offline)`;
+    let block = `\n\n--- SCREEN CONTEXT (${frames.length} captures, ranked for: ${statusLabel}) ---\n\n`;
+    block += frames.join('\n\n---\n\n');
+    block += '\n\n--- END CONTEXT ---';
+
+    if (block.length > budget) {
+      block = block.slice(0, budget) + '\n[...context trimmed to fit model window]';
+    }
+    return block;
+
+  } catch (e) {
+    return '';
+  }
 }
 
 async function sendAI() {
@@ -2050,37 +2018,27 @@ async function sendAI() {
   document.getElementById('sendBtn').disabled = true;
 
   try {
-    const { context, fallback } = await getScreenpipeContext(question);
-    const profileNote = userProfileCard ? `\n\n${userProfileCard}` : '';
-    const systemPrompt = `You are Augur, an AI assistant. Answer ONLY from screen capture evidence in the context block provided.
-Rules:
-1. Only state things directly supported by the screen data below.
-2. If something is not in the data, say: "I don't see that in your recent screen data."
-3. Do not invent apps, activities, or content not present in the data.
-4. Cite specific app names, window titles, and text snippets when available.
-5. Use **bold** for key points. No markdown headers.${profileNote}`;
+    const contextBlock = await getScreenpipeContext(question);
+    
+    const systemPrompt = `You are Augur AI — a personal assistant with access to the user's screen capture data (OCR screenshots and audio transcriptions captured by screenpipe).
 
-    // Fresh-context synthetic-turn pattern: inject context on every message
-    const syntheticCtx = context
-      ? `[Screen context retrieved for this question:${context}${fallback ? '\n[Note: context-server offline — using direct screenpipe fallback]' : ''}]`
-      : `[No screen captures matched this question. Inform the user you don't see relevant data in their recent screen history.]`;
+RULES — follow these strictly:
+1. Ground every answer in the provided SCREEN CONTEXT. Do not invent activities, apps, code, or content not present in the context.
+2. When context supports the answer: be specific. Reference exact app names, window titles, timestamps, and text visible on screen.
+3. When the context does NOT contain enough information to answer, say exactly: "I don't see that in your recent screen data."
+4. For factual/general questions unrelated to screen activity: answer from knowledge and state "From general knowledge:".
+5. Use **bold** for key facts. No markdown headers. Concise answers only.${userProfileCard ? '\n\n' + userProfileCard : ''}`;
 
-    // Mistral doesn't support system role — prepend to first user message
-    const historyMessages = chatHistory.slice(-6);
-    const isFirst = historyMessages.length === 0;
-    let messages;
-    if (isFirst) {
-      messages = [
-        { role: 'user', content: `${systemPrompt}\n\n${syntheticCtx}\n\nUser: ${question}` }
-      ];
-    } else {
-      // Inject synthetic assistant turn with fresh context before each follow-up
-      messages = [
-        ...historyMessages,
-        { role: 'assistant', content: syntheticCtx },
-        { role: 'user', content: question }
-      ];
-    }
+    // Context is always fresh — fetched above for this specific question
+    const systemTurn = { role: 'user', content: `${systemPrompt}\n\n${contextBlock}` };
+    const systemAck  = { role: 'assistant', content: 'Understood. I have your screen context. Ready to help.' };
+    const historyMessages = chatHistory.slice(-6);   // last 3 conversation pairs
+    const messages = [
+      systemTurn,
+      systemAck,
+      ...historyMessages,
+      { role: 'user', content: question }
+    ];
 
     const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
       method: 'POST',
