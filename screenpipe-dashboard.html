@@ -1543,9 +1543,11 @@ async function init() {
   await detectLMStudio();
   loadStorageStats();
   loadPersistedChat();
+  loadUserProfileCard();
   setInterval(checkHealth, 5000);
   setInterval(updateUptime, 1000);
   setInterval(loadStorageStats, 60000); // refresh storage stats every minute
+  setInterval(loadUserProfileCard, 3600000); // refresh user profile card hourly
   // Auto-refresh starts ON by default
   autoRefreshInterval = setInterval(loadFeed, 5000);
   const arBtn = document.getElementById('autoRefreshBtn');
@@ -1906,6 +1908,18 @@ let loadedModel = null; // set dynamically from /v1/models
 let aiContext = 'none';
 let chatHistory = [];
 let isThinking = false;
+let userProfileCard = null;
+
+async function loadUserProfileCard() {
+  try {
+    const r = await fetch('http://localhost:3031/context-card?days=7', { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) throw new Error('context-server unavailable');
+    const d = await r.json();
+    userProfileCard = d.card || null;
+  } catch(e) {
+    userProfileCard = null;
+  }
+}
 
 async function detectLMStudio() {
   try {
@@ -1936,7 +1950,6 @@ function askSuggestion(el) {
 
 async function getScreenpipeContext(question) {
   try {
-    // Extract keywords from question for targeted search
     const stopWords = new Set(['what','have','i','been','the','a','an','is','are','was','were','do','did','can','tell','me','all','about','on','in','at','to','for','of','and','or','my','your','any','some','this','that','how','when','where','who','why','which','with','from','by','as','it','its','be','has','had','will','would','could','should']);
     const keywords = question.toLowerCase()
       .replace(/[^a-z0-9 ]/g, ' ')
@@ -1944,63 +1957,82 @@ async function getScreenpipeContext(question) {
       .filter(w => w.length > 2 && !stopWords.has(w))
       .slice(0, 5);
 
-    // Always fetch recent screen captures
-    const recentFetch = fetch(`${API}/search?limit=20`).then(r => r.json()).catch(() => ({data:[]}));
+    let contextChunks = [];
+    let fallback = false;
 
-    // Also search by each keyword
-    const keywordFetches = keywords.map(kw =>
-      fetch(`${API}/search?q=${encodeURIComponent(kw)}&limit=10`).then(r => r.json()).catch(() => ({data:[]}))
-    );
-
-    const [recent, ...keywordResults] = await Promise.all([recentFetch, ...keywordFetches]);
-
-    // Merge and deduplicate by frame_id
-    const seen = new Set();
-    const allItems = [];
-    for (const result of [recent, ...keywordResults]) {
-      for (const item of (result.data || [])) {
-        const id = item.content?.frame_id || item.content?.timestamp;
-        if (id && !seen.has(id)) {
-          seen.add(id);
-          allItems.push(item);
+    // Try context-server on port 3031 first
+    try {
+      const ctxResp = await fetch(
+        `http://localhost:3031/context?q=${encodeURIComponent(question)}&limit=20`,
+        { signal: AbortSignal.timeout(3000) }
+      );
+      if (!ctxResp.ok) throw new Error('context-server error');
+      const ctxData = await ctxResp.json();
+      const results = ctxData.results || [];
+      contextChunks = results.map(item => {
+        const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '';
+        const app = item.app || item.url || 'unknown';
+        const win = item.window ? ` / ${item.window.slice(0, 40)}` : '';
+        const text = (item.text || '').slice(0, 400);
+        const source = (item.source || 'ocr').toUpperCase();
+        return `[${time}] [${source}: ${app}${win}]\n${text}`;
+      });
+    } catch(e) {
+      // Fallback: direct screenpipe on port 3030
+      fallback = true;
+      const recentFetch = fetch(`${API}/search?limit=20`).then(r => r.json()).catch(() => ({data:[]}));
+      const keywordFetches = keywords.map(kw =>
+        fetch(`${API}/search?q=${encodeURIComponent(kw)}&limit=10`).then(r => r.json()).catch(() => ({data:[]}))
+      );
+      const [recent, ...kwResults] = await Promise.all([recentFetch, ...keywordFetches]);
+      const seen = new Set();
+      const allItems = [];
+      for (const result of [recent, ...kwResults]) {
+        for (const item of (result.data || [])) {
+          const id = item.content?.frame_id || item.content?.timestamp;
+          if (id && !seen.has(id)) { seen.add(id); allItems.push(item); }
         }
+      }
+      if (allItems.length > 0) {
+        const now = Date.now();
+        const maxAge = 24 * 60 * 60 * 1000;
+        allItems.forEach(item => {
+          const c = item.content;
+          const blob = [c.text||'', c.transcription||'', c.app_name||'', c.window_name||''].join(' ').toLowerCase();
+          const kwScore = keywords.reduce((s, kw) => s + Math.min((blob.match(new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi'))||[]).length, 5), 0);
+          const age = now - new Date(c.timestamp || 0);
+          item._score = kwScore * 3 + Math.max(0, 1 - age / maxAge);
+        });
+        allItems.sort((a, b) => b._score - a._score);
+        contextChunks = allItems.slice(0, 20).map(item => {
+          const c = item.content;
+          const isOCR = item.type === 'OCR';
+          const time = new Date(c.timestamp).toLocaleTimeString();
+          const text = (isOCR ? c.text : c.transcription) || '';
+          const app = isOCR ? `${c.app_name} / ${(c.window_name||'').slice(0,40)}` : 'audio';
+          return `[${time}] [${app}]\n${text.slice(0, 400)}`;
+        });
       }
     }
 
-    if (allItems.length === 0) return '';
+    if (contextChunks.length === 0) return { context: '', fallback };
 
-    // Score by relevance (keyword matches) + recency, sort descending
-    const now = Date.now();
-    const maxAge = 24 * 60 * 60 * 1000; // 24h window for recency score
-    allItems.forEach(item => {
-      const c = item.content;
-      const blob = [c.text || '', c.transcription || '', c.app_name || '', c.window_name || ''].join(' ').toLowerCase();
-      const keywordScore = keywords.reduce((sum, kw) => {
-        const hits = (blob.match(new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')) || []).length;
-        return sum + Math.min(hits, 5);
-      }, 0);
-      const age = now - new Date(c.timestamp || 0);
-      const recencyScore = Math.max(0, 1 - age / maxAge);
-      item._score = keywordScore * 3 + recencyScore;
-    });
-    allItems.sort((a, b) => b._score - a._score);
-    const top = allItems.slice(0, 20);
-
-    const chunks = top.map(item => {
-      const c = item.content;
-      const isOCR = item.type === 'OCR';
-      const time = new Date(c.timestamp).toLocaleTimeString();
-      const text = (isOCR ? c.text : c.transcription) || '';
-      const app = isOCR ? `${c.app_name} / ${c.window_name}` : 'audio';
-      return `[${time}] [${app}]\n${text.slice(0, 150)}`;
-    }).join('\n\n---\n\n');
-
-    let contextText = `\n\nScreen capture context (${top.length} captures, relevance-ranked for: ${keywords.join(', ') || 'recent activity'}):\n\n${chunks}\n\nUse this data to answer the question specifically.`;
-    if (contextText.length > 6000) {
-      contextText = contextText.slice(0, 6000) + '\n[context truncated to fit model context window]';
+    // Dynamic context budget trimming: target ~5000 chars
+    const BUDGET = 5000;
+    const separator = '\n\n---\n\n';
+    const trimmed = [];
+    let total = 0;
+    for (const chunk of contextChunks) {
+      if (total + chunk.length + separator.length > BUDGET) break;
+      trimmed.push(chunk);
+      total += chunk.length + separator.length;
     }
-    return contextText;
-  } catch(e) { return ''; }
+    if (trimmed.length === 0) trimmed.push(contextChunks[0].slice(0, BUDGET));
+    const contextText = trimmed.join(separator);
+
+    const header = `\n\nScreen capture context (${contextChunks.length} captures, showing ${trimmed.length}):\n\n`;
+    return { context: header + contextText, fallback };
+  } catch(e) { return { context: '', fallback: false }; }
 }
 
 async function sendAI() {
@@ -2018,16 +2050,37 @@ async function sendAI() {
   document.getElementById('sendBtn').disabled = true;
 
   try {
-    const contextBlock = await getScreenpipeContext(question);
-    const systemPrompt = `You are a helpful AI assistant with access to screenpipe data -- OCR captures of the user's screen. Answer concisely and helpfully. Use **bold** for key points. No markdown headers.${contextBlock}`;
-    
-    // Mistral doesn't support system role -- prepend to first user message
-    const userMessageWithSystem = `${systemPrompt}\n\nUser: ${question}`;
-    const historyMessages = chatHistory.slice(-8);
-    const messages = [
-      ...historyMessages,
-      { role: 'user', content: historyMessages.length === 0 ? userMessageWithSystem : question }
-    ];
+    const { context, fallback } = await getScreenpipeContext(question);
+    const profileNote = userProfileCard ? `\n\n${userProfileCard}` : '';
+    const systemPrompt = `You are Augur, an AI assistant. Answer ONLY from screen capture evidence in the context block provided.
+Rules:
+1. Only state things directly supported by the screen data below.
+2. If something is not in the data, say: "I don't see that in your recent screen data."
+3. Do not invent apps, activities, or content not present in the data.
+4. Cite specific app names, window titles, and text snippets when available.
+5. Use **bold** for key points. No markdown headers.${profileNote}`;
+
+    // Fresh-context synthetic-turn pattern: inject context on every message
+    const syntheticCtx = context
+      ? `[Screen context retrieved for this question:${context}${fallback ? '\n[Note: context-server offline — using direct screenpipe fallback]' : ''}]`
+      : `[No screen captures matched this question. Inform the user you don't see relevant data in their recent screen history.]`;
+
+    // Mistral doesn't support system role — prepend to first user message
+    const historyMessages = chatHistory.slice(-6);
+    const isFirst = historyMessages.length === 0;
+    let messages;
+    if (isFirst) {
+      messages = [
+        { role: 'user', content: `${systemPrompt}\n\n${syntheticCtx}\n\nUser: ${question}` }
+      ];
+    } else {
+      // Inject synthetic assistant turn with fresh context before each follow-up
+      messages = [
+        ...historyMessages,
+        { role: 'assistant', content: syntheticCtx },
+        { role: 'user', content: question }
+      ];
+    }
 
     const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
       method: 'POST',
