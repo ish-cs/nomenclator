@@ -937,6 +937,7 @@
 .browser-card:hover { border-color:rgba(0,255,135,.3); }
 .browser-url { font-size:10px; color:var(--dim); font-family:var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:340px; margin-left:6px; }
 .browser-selected { font-size:11px; color:var(--green); font-style:italic; margin-top:6px; border-left:2px solid var(--green); padding-left:8px; }
+.badge { font-size: 9px; letter-spacing: 1.5px; text-transform: uppercase; padding: 2px 7px; border-radius: 2px; font-weight: 500; }
 .badge-browser { background:rgba(0,180,255,.12); color:#00b4ff; border:1px solid rgba(0,180,255,.3); }
 .capture-meta { font-size:10px; color:var(--dimmer); font-family:var(--mono); margin-top:2px; }
 </style>
@@ -2229,7 +2230,7 @@ async function loadBrowserActivity() {
     const r = await fetch('http://localhost:3031/browser-captures?limit=50');
     if (!r.ok) throw new Error('Context API unavailable — is context-server.py running?');
     const d = await r.json();
-    const captures = d.captures || [];
+    const captures = d.results || [];
 
     if (captures.length === 0) {
       el.innerHTML = `<div class="empty">
@@ -2243,8 +2244,8 @@ async function loadBrowserActivity() {
     el.innerHTML = captures.map(cap => {
       const time = cap.timestamp ? new Date(cap.timestamp).toLocaleTimeString() : '';
       const date = cap.timestamp ? new Date(cap.timestamp).toLocaleDateString() : '';
-      const dwell = cap.dwell_seconds != null ? `${Math.round(cap.dwell_seconds)}s` : '';
-      const scroll = cap.scroll_depth != null ? `${Math.round(cap.scroll_depth * 100)}% scroll` : '';
+      const dwell = cap.time_on_page_s != null ? `${Math.round(cap.time_on_page_s)}s` : '';
+      const scroll = cap.scroll_depth_pct != null ? `${Math.round(cap.scroll_depth_pct)}% scroll` : '';
       const selected = cap.selected_text ? `<div class="browser-selected">"${cap.selected_text.slice(0,200)}"</div>` : '';
       const meta = [dwell, scroll].filter(Boolean).join(' · ');
       return `<div class="browser-card">

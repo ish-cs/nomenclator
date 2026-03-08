@@ -137,8 +137,6 @@ def semantic_query(query_text, n_results=15, embedder=None, collection=None):
     Run a semantic similarity search against the indexed captures.
     Returns a dict with 'query', 'total_indexed', 'results'.
     """
-    if embedder is None:
-        embedder = get_embedder()
     if collection is None:
         client = get_client()
         collection = get_collection(client)
@@ -151,6 +149,9 @@ def semantic_query(query_text, n_results=15, embedder=None, collection=None):
             'results': [],
             'note': 'Index is empty. Run: python semantic_search.py --index',
         }
+
+    if embedder is None:
+        embedder = get_embedder()
 
     query_embedding = embedder.encode([query_text], show_progress_bar=False).tolist()
     n = min(n_results, total)

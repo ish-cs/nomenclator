@@ -5,8 +5,8 @@ Augur — Feature Tests
 Tests all implemented roadmap features without requiring live screenpipe.
 
 Run with:
-  python test_features.py
-  python test_features.py --live   (also tests endpoints against running context-server)
+  python3 test_features.py
+  python3 test_features.py --live   (also tests endpoints against running context-server)
 """
 
 import json
@@ -175,17 +175,7 @@ class TestBrowserCaptures(unittest.TestCase):
         print("  [PASS] context-server.py has browser capture endpoints")
 
     def test_browser_capture_storage_logic(self):
-        """Browser capture storage: save and retrieve."""
-        # Test the logic directly by importing context-server functions
-        # We do this by importing with a temp path
-        import importlib.util, types
-
-        spec = importlib.util.spec_from_file_location(
-            "cs",
-            os.path.join(os.path.dirname(__file__), "context-server.py")
-        )
-        cs = types.ModuleType("cs")
-
+        """Browser capture storage: JSON round-trip for save and retrieve."""
         # Patch the file path to use a temp file
         with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
             tmp_path = f.name
@@ -910,8 +900,10 @@ if __name__ == '__main__':
     # Live endpoint tests (skipped unless --live)
     suite.addTests(loader.loadTestsFromTestCase(TestContextServerEndpoints))
 
-    runner = unittest.TextTestRunner(verbosity=0, stream=open(os.devnull, 'w'))
+    _devnull = open(os.devnull, 'w')
+    runner = unittest.TextTestRunner(verbosity=0, stream=_devnull)
     result = runner.run(suite)
+    _devnull.close()
 
     print()
     total = result.testsRun

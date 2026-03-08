@@ -263,7 +263,8 @@ def run_single_query(question, model=None, backend='lmstudio'):
 
     context_block = format_context_block(results)
 
-    print("  Asking LM Studio...")
+    backend_label = {'claude': 'Claude', 'openai': 'OpenAI', 'gpt': 'OpenAI'}.get(backend, 'LM Studio')
+    print(f"  Asking {backend_label}...")
     print()
     answer = ask_llm(question, context_block, model, backend=backend)
     if answer:
@@ -275,7 +276,7 @@ def run_single_query(question, model=None, backend='lmstudio'):
         print()
         print("  " + "─" * 60)
     else:
-        print("  [!] No answer received from LM Studio.")
+        print(f"  [!] No answer received from {backend_label}.")
 
 
 def run_watch_mode(model=None, backend='lmstudio'):

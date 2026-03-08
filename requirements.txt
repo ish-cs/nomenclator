@@ -1,8 +1,9 @@
 # Augur — Python dependencies
-# Install with: pip install -r requirements.txt
+# Install with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# Note: Homebrew Python (macOS) is externally managed (PEP 668) — use a venv, not system pip.
 
 # Semantic search (vector store + embeddings)
-chromadb>=0.4.0
+chromadb>=1.0.0
 sentence-transformers>=2.2.0
 
 # Optional LLM backends for demo_agent.py (--api flag):
