@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>screenpipe</title>
+<title>Augur</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;700;800&display=swap');
 
@@ -553,8 +553,8 @@
   .ai-tab {
     display: flex;
     flex-direction: column;
-    flex: 1;
-    height: calc(100vh - 180px);
+    height: calc(100vh - 61px - 57px - 45px);
+    overflow: hidden;
   }
 
   .ai-context-bar {
@@ -585,6 +585,7 @@
   .ai-messages {
     flex: 1;
     overflow-y: auto;
+    min-height: 0;
     padding: 20px 24px;
     display: flex;
     flex-direction: column;
@@ -635,6 +636,7 @@
   .ai-input-area {
     padding: 16px 24px; border-top: 1px solid var(--border);
     display: flex; gap: 10px; align-items: flex-end;
+    flex-shrink: 0;
   }
 
   .ai-input-wrap { flex: 1; }
@@ -947,7 +949,7 @@
 <header>
   <div class="logo">
     <div class="logo-dot" id="headerDot"></div>
-    screenpipe
+    Augur
   </div>
   <div class="status-bar">
     <div class="status-pill" id="statusPill">
@@ -996,14 +998,8 @@
         <button class="btn" onclick="exportData()">
           <span class="btn-icon">↓</span> Export JSON
         </button>
-        <button class="btn summary" onclick="dailySummary()">
-          <span class="btn-icon">◈</span> Today's Summary
-        </button>
         <button class="btn snapshot" onclick="exportContextSnapshot()">
           <span class="btn-icon">◈</span> Export Context Snapshot
-        </button>
-        <button class="btn danger" onclick="confirmStop()">
-          <span class="btn-icon">■</span> Stop screenpipe
         </button>
       </div>
     </div>
@@ -1044,9 +1040,9 @@
 
     <div class="tabs">
       <div class="tab active" onclick="switchTab('feed', this)">Live Feed</div>
+      <div class="tab" onclick="switchTab('ai', this)">✦ Ask AI</div>
       <div class="tab" onclick="switchTab('search', this)">Search Results</div>
       <div class="tab" onclick="switchTab('raw', this)">Raw SQL</div>
-      <div class="tab" onclick="switchTab('ai', this)">✦ Ask AI</div>
       <div class="tab" onclick="switchTab('timeline', this)">Timeline</div>
       <div class="tab" onclick="switchTab('anomalies', this)">Anomalies</div>
       <div class="tab" onclick="switchTab('browser', this)">Browser</div>
@@ -1057,47 +1053,12 @@
     </div>
 
     <div class="error-banner" id="errorBanner">
-      ⚠ Cannot connect to screenpipe at localhost:3030. Make sure it's running.
+      ⚠ Cannot connect to Augur at localhost:3030. Make sure it's running.
     </div>
 
     <!-- Feed tab -->
     <div class="feed" id="feedTab">
       <div class="loading"><div class="spinner"></div> Loading captures...</div>
-    </div>
-
-    <!-- Search tab -->
-    <div class="feed" id="searchTab" style="display:none">
-      <div class="search-mode-row">
-        <button id="modeKeyword"  class="mode-btn active" onclick="setSearchMode('keyword')">Keyword</button>
-        <button id="modeSemantic" class="mode-btn"         onclick="setSearchMode('semantic')">Semantic</button>
-        <span id="searchModeHint" class="mode-hint"></span>
-      </div>
-      <div id="searchResults">
-        <div class="empty">
-          <div class="empty-icon">⌕</div>
-          <div class="empty-title">Search your screen history</div>
-          <div class="empty-sub">Type anything above and hit SEARCH.<br>Screenpipe has OCR'd everything on your screen.</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Raw SQL tab -->
-    <div class="feed" id="rawTab" style="display:none">
-      <div style="padding:4px 0 16px">
-        <div class="section-label">query the sqlite database directly</div>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <input type="text" id="sqlInput" style="flex:1" 
-                 placeholder="SELECT * FROM frames LIMIT 10"
-                 onkeydown="if(event.key==='Enter') doSQL()">
-          <button class="search-btn" onclick="doSQL()">RUN →</button>
-        </div>
-        <div style="font-size:10px;color:var(--dimmer);margin-top:8px">
-          Try: <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT app_name, window_name, COUNT(*) as count FROM frames GROUP BY app_name ORDER BY count DESC LIMIT 20')">top apps by screen time</span>
-          &nbsp;·&nbsp;
-          <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT * FROM frames ORDER BY timestamp DESC LIMIT 10')">recent frames</span>
-        </div>
-      </div>
-      <div id="sqlResults"></div>
     </div>
 
     <!-- AI Chat tab -->
@@ -1122,7 +1083,7 @@
           <div class="msg-avatar">AI</div>
           <div>
             <div class="msg-bubble">
-              Hey — I can answer questions about what screenpipe has captured on your screen.<br><br>
+              Hey — I can answer questions about what Augur has captured on your screen.<br><br>
               Try asking <strong>"What have I been working on today?"</strong> with <strong>recent screen</strong> context enabled, or just ask me anything general.
             </div>
             <div class="msg-time">now</div>
@@ -1140,6 +1101,41 @@
         <button class="send-btn" id="sendBtn" onclick="sendAI()">SEND →</button>
       </div>
 
+    </div>
+
+    <!-- Search tab -->
+    <div class="feed" id="searchTab" style="display:none">
+      <div class="search-mode-row">
+        <button id="modeKeyword"  class="mode-btn active" onclick="setSearchMode('keyword')">Keyword</button>
+        <button id="modeSemantic" class="mode-btn"         onclick="setSearchMode('semantic')">Semantic</button>
+        <span id="searchModeHint" class="mode-hint"></span>
+      </div>
+      <div id="searchResults">
+        <div class="empty">
+          <div class="empty-icon">⌕</div>
+          <div class="empty-title">Search your screen history</div>
+          <div class="empty-sub">Type anything above and hit SEARCH.<br>Augur has OCR'd everything on your screen.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Raw SQL tab -->
+    <div class="feed" id="rawTab" style="display:none">
+      <div style="padding:4px 0 16px">
+        <div class="section-label">query the sqlite database directly</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <input type="text" id="sqlInput" style="flex:1"
+                 placeholder="SELECT * FROM frames LIMIT 10"
+                 onkeydown="if(event.key==='Enter') doSQL()">
+          <button class="search-btn" onclick="doSQL()">RUN →</button>
+        </div>
+        <div style="font-size:10px;color:var(--dimmer);margin-top:8px">
+          Try: <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT app_name, window_name, COUNT(*) as count FROM frames GROUP BY app_name ORDER BY count DESC LIMIT 20')">top apps by screen time</span>
+          &nbsp;·&nbsp;
+          <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT * FROM frames ORDER BY timestamp DESC LIMIT 10')">recent frames</span>
+        </div>
+      </div>
+      <div id="sqlResults"></div>
     </div>
 
     <!-- Timeline tab -->
@@ -1204,7 +1200,7 @@
 
 <script>
 const API = 'http://localhost:3030';
-let autoRefresh = false;
+let autoRefresh = true;
 let autoRefreshInterval = null;
 let currentTab = 'feed';
 let startTime = Date.now();
@@ -1287,7 +1283,7 @@ async function cleanupOldData() {
 
 // ── Daily Summary ─────────────────────────────────────────────────
 async function dailySummary() {
-  switchTab('ai', document.querySelectorAll('.tab')[3]);
+  switchTab('ai', document.querySelectorAll('.tab')[1]);
   document.getElementById('suggestions').style.display = 'none';
 
   appendMsg('user', "What did I do today? Give me a structured summary.");
@@ -1307,7 +1303,7 @@ async function dailySummary() {
 
     if (!todayFrames || todayFrames.length === 0) {
       removeTyping();
-      appendMsg('ai', "No screen captures found for today yet. Make sure screenpipe is running and has been recording.");
+      appendMsg('ai', "No screen captures found for today yet. Make sure Augur is running and has been recording.");
       isThinking = false;
       document.getElementById('sendBtn').disabled = false;
       return;
@@ -1395,7 +1391,7 @@ async function loadTimeline() {
       el.innerHTML = `<div class="empty">
         <div class="empty-icon">▦</div>
         <div class="empty-title">No captures today yet</div>
-        <div class="empty-sub">Screenpipe needs to record some data first.</div>
+        <div class="empty-sub">Augur needs to record some data first.</div>
       </div>`;
       return;
     }
@@ -1550,6 +1546,10 @@ async function init() {
   setInterval(checkHealth, 5000);
   setInterval(updateUptime, 1000);
   setInterval(loadStorageStats, 60000); // refresh storage stats every minute
+  // Auto-refresh starts ON by default
+  autoRefreshInterval = setInterval(loadFeed, 5000);
+  const arBtn = document.getElementById('autoRefreshBtn');
+  if (arBtn) { arBtn.innerHTML = '<span class="btn-icon">⏱</span> Auto-refresh: ON'; arBtn.style.color = 'var(--green)'; }
 }
 
 // ── Health check ──────────────────────────────────────────────────
@@ -1622,7 +1622,7 @@ async function loadFeed() {
       feed.innerHTML = `<div class="empty">
         <div class="empty-icon">◉</div>
         <div class="empty-title">Capturing...</div>
-        <div class="empty-sub">Screenpipe is recording. Results will appear here shortly.</div>
+        <div class="empty-sub">Augur is recording. Results will appear here shortly.</div>
       </div>`;
       return;
     }
@@ -1632,7 +1632,7 @@ async function loadFeed() {
     feed.innerHTML = `<div class="empty">
       <div class="empty-icon">✕</div>
       <div class="empty-title">Connection failed</div>
-      <div class="empty-sub">Make sure screenpipe is running at localhost:3030</div>
+      <div class="empty-sub">Make sure Augur is running at localhost:3030</div>
     </div>`;
   }
 }
@@ -1651,7 +1651,7 @@ function setSearchMode(mode) {
 async function doSearch() {
   const q = document.getElementById('searchInput').value.trim();
   if (!q) return;
-  switchTab('search', document.querySelectorAll('.tab')[1]);
+  switchTab('search', document.querySelectorAll('.tab')[2]);
   if (_searchMode === 'semantic') {
     await _doSemanticSearch(q);
   } else {
@@ -1778,7 +1778,7 @@ async function doSQL() {
 
 function setSQL(q) {
   document.getElementById('sqlInput').value = q;
-  switchTab('raw', document.querySelectorAll('.tab')[2]);
+  switchTab('raw', document.querySelectorAll('.tab')[3]);
 }
 
 // ── Render card ───────────────────────────────────────────────────
@@ -1995,7 +1995,11 @@ async function getScreenpipeContext(question) {
       return `[${time}] [${app}]\n${text.slice(0, 150)}`;
     }).join('\n\n---\n\n');
 
-    return `\n\nScreen capture context (${top.length} captures, relevance-ranked for: ${keywords.join(', ') || 'recent activity'}):\n\n${chunks}\n\nUse this data to answer the question specifically.`;
+    let contextText = `\n\nScreen capture context (${top.length} captures, relevance-ranked for: ${keywords.join(', ') || 'recent activity'}):\n\n${chunks}\n\nUse this data to answer the question specifically.`;
+    if (contextText.length > 6000) {
+      contextText = contextText.slice(0, 6000) + '\n[context truncated to fit model context window]';
+    }
+    return contextText;
   } catch(e) { return ''; }
 }
 
@@ -2053,7 +2057,7 @@ async function sendAI() {
 
   } catch(e) {
     removeTyping();
-    appendMsg('ai', `**LM Studio error.** ${e.message}\n\nAlso check:\n1. LM Studio Local Server tab is running\n2. A model is loaded`);
+    appendMsg('ai', `Could not generate a response — context was too large or LM Studio is unavailable. If this persists, increase Context Length to 8192+ in LM Studio → Local Server settings.`);
   }
 
   isThinking = false;
@@ -2119,7 +2123,7 @@ function clearChat() {
     <div class="msg-avatar">AI</div>
     <div>
       <div class="msg-bubble">
-        Hey — I can answer questions about what screenpipe has captured on your screen.<br><br>
+        Hey — I can answer questions about what Augur has captured on your screen.<br><br>
         Try asking <strong>"What have I been working on today?"</strong> or just ask me anything general.
       </div>
       <div class="msg-time">now</div>
@@ -2222,47 +2226,98 @@ function renderAnomalies(data) {
 }
 
 // ── Browser Activity ──────────────────────────────────────────────
+function _formatBrowserTimestamp(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const now = new Date();
+  const isToday = d.toDateString() === now.toDateString();
+  const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return isToday ? `Today at ${timeStr}` : `${d.toLocaleDateString()} at ${timeStr}`;
+}
+
+function _formatDwell(secs) {
+  if (secs == null) return '';
+  const s = Math.round(secs);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+}
+
+let _browserLoaded = false;
+
 async function loadBrowserActivity() {
   const el = document.getElementById('browserContent');
   el.innerHTML = '<div class="loading"><div class="spinner"></div> Loading browser captures...</div>';
 
   try {
-    const r = await fetch('http://localhost:3031/browser-captures?limit=50');
-    if (!r.ok) throw new Error('Context API unavailable — is context-server.py running?');
+    let r;
+    try {
+      r = await fetch('http://localhost:3031/browser-captures?limit=50');
+    } catch(fetchErr) {
+      el.innerHTML = `<div class="empty">
+        <div class="empty-icon">⬡</div>
+        <div class="empty-title">Context API not running</div>
+        <div class="empty-sub">Context API not running — start Augur via launch.command</div>
+      </div>`;
+      return;
+    }
+
+    if (!r.ok) {
+      el.innerHTML = `<div class="empty">
+        <div class="empty-icon">⬡</div>
+        <div class="empty-title">Context API not running</div>
+        <div class="empty-sub">Context API not running — start Augur via launch.command</div>
+      </div>`;
+      return;
+    }
+
     const d = await r.json();
-    const captures = d.results || [];
+    const captures = (d.results || d.captures || d.data || d) instanceof Array
+      ? (d.results || d.captures || d.data || d)
+      : [];
+
+    _browserLoaded = true;
 
     if (captures.length === 0) {
       el.innerHTML = `<div class="empty">
         <div class="empty-icon">⬡</div>
         <div class="empty-title">No browser captures yet</div>
-        <div class="empty-sub">Install the Augur browser extension and browse normally.<br>Captures appear here automatically.</div>
+        <div class="empty-sub">No browser captures yet. Install the browser extension and visit some pages.</div>
       </div>`;
       return;
     }
 
     el.innerHTML = captures.map(cap => {
-      const time = cap.timestamp ? new Date(cap.timestamp).toLocaleTimeString() : '';
-      const date = cap.timestamp ? new Date(cap.timestamp).toLocaleDateString() : '';
-      const dwell = cap.time_on_page_s != null ? `${Math.round(cap.time_on_page_s)}s` : '';
-      const scroll = cap.scroll_depth_pct != null ? `${Math.round(cap.scroll_depth_pct)}% scroll` : '';
-      const selected = cap.selected_text ? `<div class="browser-selected">"${cap.selected_text.slice(0,200)}"</div>` : '';
-      const meta = [dwell, scroll].filter(Boolean).join(' · ');
+      const tsFormatted = _formatBrowserTimestamp(cap.timestamp);
+      const dwellFormatted = _formatDwell(cap.time_on_page_s);
+      const scrollFormatted = cap.scroll_depth_pct != null ? `${Math.round(cap.scroll_depth_pct)}%` : '';
+      const selected = cap.selected_text
+        ? `<div class="browser-selected">"${cap.selected_text.slice(0, 200)}"</div>`
+        : '';
+      const urlDisplay = cap.url
+        ? `<a href="${cap.url}" target="_blank" style="color:var(--blue);text-decoration:none" title="${cap.url}">${cap.url.slice(0, 80)}${cap.url.length > 80 ? '…' : ''}</a>`
+        : '';
+      const metaParts = [];
+      if (dwellFormatted) metaParts.push(`⏱ ${dwellFormatted}`);
+      if (scrollFormatted) metaParts.push(`↕ ${scrollFormatted}`);
+      const meta = metaParts.join(' · ');
       return `<div class="browser-card">
-        <div class="card-header">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
           <span class="badge badge-browser">BROWSER</span>
-          <span class="browser-url">${cap.url || ''}</span>
-          <span style="margin-left:auto;font-size:10px;color:var(--dimmer)">${date} ${time}</span>
+          <span class="browser-url">${urlDisplay}</span>
+          <span style="margin-left:auto;font-size:10px;color:var(--dimmer);white-space:nowrap">${tsFormatted}</span>
         </div>
-        <div style="font-size:12px;color:var(--text);margin:6px 0 2px">${cap.title || ''}</div>
-        ${meta ? `<div class="capture-meta">${meta}</div>` : ''}
+        <div style="font-size:12px;color:var(--text);margin:4px 0 2px;font-weight:500">${cap.title || cap.page_title || ''}</div>
+        ${meta ? `<div class="capture-meta" style="margin-top:4px">${meta}</div>` : ''}
         ${selected}
       </div>`;
     }).join('');
   } catch(e) {
     el.innerHTML = `<div class="empty">
-      <div class="empty-title">Could not load browser captures</div>
-      <div class="empty-sub">${e.message}</div>
+      <div class="empty-icon">⬡</div>
+      <div class="empty-title">Context API not running</div>
+      <div class="empty-sub">Context API not running — start Augur via launch.command</div>
     </div>`;
   }
 }

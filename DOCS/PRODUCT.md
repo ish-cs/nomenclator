@@ -1,6 +1,6 @@
 # Augur — Product Document
 
-# CURRENT VERSION: v0.3
+# CURRENT VERSION: v0.3.1
 
 ---
 
@@ -67,7 +67,7 @@ Screenpipe provides the capture layer. Augur builds the retrieval and delivery i
 ```
 nomenclator/
 ├── screenpipe-dashboard.html   # Full browser dashboard
-├── launch.command              # Double-click launcher (starts everything)
+├── launch.command              # Double-click launcher — opens Augur GUI app with service status + start/stop controls
 ├── context-server.py           # Context API server — the actual product
 ├── demo_agent.py               # Agent integration demo / investor demo
 ├── semantic_search.py          # Chroma vector store indexer + semantic query
@@ -243,11 +243,9 @@ Two-column grid: 280px sidebar + fluid main content. Full viewport height minus 
 
 #### Controls
 1. **Refresh feed** — re-fetches the live feed
-2. **Auto-refresh ON/OFF** — 5-second poll interval
+2. **Auto-refresh ON/OFF** — 5-second poll interval; defaults to ON
 3. **Export JSON** — downloads 100 most recent records
-4. **Today's Summary** — one-click AI daily digest
-5. **Export Context Snapshot** — downloads 7-day behavioral profile JSON (new in v0.1)
-6. **Stop screenpipe** — advisory dialog with stop instructions
+4. **Export Context Snapshot** — downloads 7-day behavioral profile JSON
 
 #### Storage
 - Frame + audio chunk counts, estimated DB size, 7-day history
@@ -258,14 +256,14 @@ Two-column grid: 280px sidebar + fluid main content. Full viewport height minus 
 ### Tab 1: Live Feed
 20 most recent captures as cards. Each card: type badge, app/window, timestamp, OCR text (expandable), URL.
 
-### Tab 2: Search Results
+### Tab 2: Ask AI ✦
+Chat interface with automatic context injection. Fixed-height scrollable chat container — page no longer scrolls. See AI Features section below.
+
+### Tab 3: Search Results
 Full-text search with mode toggle. **Keyword** mode: screenpipe `/search` endpoint, matched terms highlighted. **Semantic** mode: calls `/context` via Context API, results ranked by hybrid score with similarity shown. Mode hint explains semantic requirements.
 
-### Tab 3: Raw SQL
+### Tab 4: Raw SQL
 Direct SQLite queries. Results as auto-detected table. Two preset shortcuts (top apps, recent frames).
-
-### Tab 4: Ask AI ✦
-Chat interface with automatic context injection. See AI Features section below.
 
 ### Tab 6: Anomalies (new in v0.2)
 Behavioral anomaly detection. Compares today's per-app frame counts against a rolling N-day baseline (default 7). Flags:
@@ -385,15 +383,22 @@ Cloud backends are lazily imported — `anthropic`/`openai` packages only needed
 
 ## Launch Script (`launch.command`)
 
-Double-click in Finder or run in Terminal. Steps:
+Double-click in Finder. Replaces the terminal keep-alive loop with a `tkinter.Tk()` window titled "Augur".
 
-1. **Cleanup:** deletes raw screenpipe files in `~/.screenpipe/data/` older than `CLEANUP_DAYS` (default: 7). Prints freed MB.
+**Startup sequence** (runs in a background thread immediately on launch):
+1. **Cleanup:** deletes raw screenpipe files in `~/.screenpipe/data/` older than `CLEANUP_DAYS` (default: 7)
 2. **screenpipe:** checks if running on :3030; starts it if not, polls up to 15s for startup
 3. **Context API:** checks if running on :3031; starts `context-server.py` as a background subprocess if not
 4. **Semantic indexer:** checks if `chromadb` + `sentence_transformers` are installed; if so and indexer not running, starts `semantic_search.py` as a detached subprocess; tracks PID in `~/.screenpipe/semantic_indexer.pid`
 5. **LM Studio:** checks :1234, warns if offline (non-blocking)
-6. **Dashboard:** checks HTML file exists, opens in browser
-7. **Keep-alive:** prints `[screenpipe: up] [context-api: up] [semantic: up/down] [LM Studio: up]` every 10 seconds
+6. **Dashboard:** opens in Chrome automatically
+
+**GUI window provides:**
+- Live status indicators for 4 services (screenpipe, Context API, Semantic Indexer, LM Studio), polled every 5s
+- `Start Screenpipe` button — starts screenpipe in a thread, disables while starting, re-enables when port 3030 is open
+- `Stop Screenpipe` button — runs `pkill screenpipe`
+- Scrollable log area (replaces terminal print output)
+- Closing the window does not kill background services
 
 **Config knobs at top of file:**
 ```python
@@ -471,3 +476,13 @@ The live feed polls every 5 seconds. The "LIVE" badge is cosmetic.
 - [x] `/context-card` endpoint — ultra-compact profile string for drop-in LLM system prompt injection
 - [x] Dashboard: Browser Activity tab showing recent extension captures
 - [x] Dashboard: Keyword / Semantic search mode toggle in the Search tab
+
+### v0.3.1 (shipped)
+- [x] `launch.command` opens a tkinter GUI window instead of a terminal — shows live service status + Start/Stop screenpipe controls
+- [x] Fixed LM Studio context window overflow in AI chat context injection (hard-cap at 6000 chars)
+- [x] All app UI renamed from "screenpipe" to "Augur" (branding pass)
+- [x] Removed Stop Screenpipe and Today's Summary buttons from sidebar
+- [x] Auto-refresh defaults to ON
+- [x] Ask AI tab: fixed-height scrollable chat container (page no longer scrolls)
+- [x] Ask AI tab moved to second position (immediately right of Live Feed)
+- [x] Browser Captures tab fixed — loads data and displays all captured fields

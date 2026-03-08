@@ -67,15 +67,15 @@ The user (Ishaan) is building a startup around a **personal context layer for AI
   - Fonts: JetBrains Mono + Syne from Google Fonts
   - Dark terminal aesthetic, green (#00ff87) accent color
 
-## Dashboard features (v0.3)
+## Dashboard features (v0.3.1)
 1. **Live Feed tab** — recent OCR+audio captures as expandable cards
-2. **Search Results tab** — keyword search + semantic search mode toggle (Keyword / Semantic buttons)
-3. **Raw SQL tab** — direct SQLite queries, auto-detected table output, presets
-4. **Ask AI tab** — chat with LM Studio; smart context injection; persistent localStorage memory (50-msg cap, clear button)
+2. **Ask AI tab** — chat with LM Studio; smart context injection; persistent localStorage memory (50-msg cap, clear button); fixed-height scrollable chat (page no longer scrolls); tab is now second position (right of Live Feed)
+3. **Search Results tab** — keyword search + semantic search mode toggle (Keyword / Semantic buttons)
+4. **Raw SQL tab** — direct SQLite queries, auto-detected table output, presets
 5. **Timeline tab** — gantt chart of today's app activity by hour; click block → detail panel
 6. **Anomalies tab** — behavioral anomaly detection vs N-day rolling baseline; requires context-server.py
-7. **Browser tab** (v0.3) — recent browser extension captures (URL, dwell, selections); requires context-server.py
-8. **Sidebar**: Refresh, Auto-refresh, Export JSON, Today's Summary, Export Context Snapshot, Stop screenpipe
+7. **Browser tab** — recent browser extension captures; displays all fields: URL, title, time on page, scroll depth, selected text, timestamp; requires context-server.py
+8. **Sidebar**: Refresh, Auto-refresh (defaults to ON), Export JSON, Export Context Snapshot
 
 ## AI context system (important)
 Always-on smart search. For every question:
@@ -88,13 +88,24 @@ Always-on smart search. For every question:
 7. Top N fed as formatted context block into LLM prompt
 
 ## launch.command startup sequence
-1. `cleanup_old_files()` — deletes `~/.screenpipe/data/` files older than `CLEANUP_DAYS` (default 7)
-2. Check/start screenpipe on :3030
-3. Check/start `context-server.py` on :3031 as subprocess
-4. Check deps (`chromadb`, `sentence_transformers`) via `importlib.import_module`; if available and indexer not running, start `semantic_search.py` as detached subprocess; write PID to `~/.screenpipe/semantic_indexer.pid`
-5. Check LM Studio on :1234 (non-blocking warning)
-6. Open dashboard in browser
-7. Keep-alive loop: `[screenpipe: up] [context-api: up] [semantic: up/down] [LM Studio: up]`
+`launch.command` is now a tkinter GUI app, not a terminal script.
+
+**On launch:**
+- Opens a `tkinter.Tk()` window titled "Augur"
+- Startup sequence runs immediately in a background thread (same steps as before):
+  1. `cleanup_old_files()` — deletes `~/.screenpipe/data/` files older than `CLEANUP_DAYS` (default 7)
+  2. Check/start screenpipe on :3030
+  3. Check/start `context-server.py` on :3031 as subprocess
+  4. Check deps (`chromadb`, `sentence_transformers`) via `importlib.import_module`; if available and indexer not running, start `semantic_search.py` as detached subprocess; write PID to `~/.screenpipe/semantic_indexer.pid`
+  5. Check LM Studio on :1234 (non-blocking warning)
+  6. Open dashboard in browser (Chrome)
+
+**GUI window:**
+- Live status indicators for 4 services (screenpipe, Context API, Semantic Indexer, LM Studio), updated every 5s via `root.after()`
+- `Start Screenpipe` button: starts screenpipe in a thread, disables while starting, re-enables when port 3030 is open
+- `Stop Screenpipe` button: runs `pkill screenpipe`
+- Scrollable log area replaces all terminal print output
+- Closing the window does NOT kill screenpipe — services keep running
 
 ## Known gotchas
 - Timestamps: strip timezone for naive comparison — `replace('Z', '+00:00').replace('+00:00', '')`
@@ -105,6 +116,8 @@ Always-on smart search. For every question:
 - MCP notifications have no `id` field — check before calling `_write_message()` or you'll crash the protocol
 - Browser captures UID format: `browser_XXXXXXXXX` (timestamp-based) — never collides with integer OCR frame_ids
 - Semantic globals `_semantic_embedder`, `_semantic_collection`, `_semantic_available` cached module-level; `None` = untested, `False` = unavailable
+- `root.after()` must be used for all tkinter UI updates from threads — never update widgets directly from a non-main thread; use `root.after(0, lambda: ...)` pattern
+- AI chat context text must be capped before sending to LLM — assembled context block hard-capped at 6000 chars to avoid LM Studio context window 400 errors
 
 ## Screenpipe binary location
 ```/
@@ -116,6 +129,9 @@ Always-on smart search. For every question:
 2. Run `python3 context-server.py` in Terminal
 3. Open LM Studio → Local Server → enable CORS → load a model → Start Server
 4. Open `screenpipe-dashboard.html` in Chrome
+
+## v0.3.1 — shipped
+All v0.3.1 features complete: tkinter GUI launcher, context window fix, Augur branding, sidebar cleanup, Ask AI scroll fix, Ask AI tab reorder, Browser tab fix.
 
 ## v0.3 — shipped
 All v0.3 features complete:

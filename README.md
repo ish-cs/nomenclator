@@ -21,13 +21,12 @@ Drop-in integration with Claude Desktop, Cursor, and any MCP-compatible AI agent
 
 ### Dashboard
 - **Live Feed** — real-time view of OCR captures and audio transcriptions
+- **Ask AI** — chat with a local LLM (or Claude/OpenAI) that has automatic access to your screen context
 - **Search** — keyword search or semantic search (requires semantic indexer) across your entire screen history
 - **Raw SQL** — direct queries against the screenpipe SQLite database
-- **Ask AI** — chat with a local LLM (or Claude/OpenAI) that has automatic access to your screen context
 - **Timeline** — gantt-style chart of today's app activity by hour
 - **Anomalies** — behavioral anomaly detection vs rolling N-day baseline
-- **Browser Activity** — recent browser extension captures: URL, dwell time, text selections
-- **Today's Summary** — one-click AI-generated digest: activities, apps, topics, action items
+- **Browser Activity** — recent browser extension captures: URL, title, dwell time, scroll depth, text selections
 - **Context Snapshot** — export a 7-day behavioral profile as structured JSON
 
 ---
@@ -128,16 +127,15 @@ Download [LM Studio](https://lmstudio.ai), then:
 
 ### Option A: Double-click launcher (recommended)
 
-Double-click `launch.command` in Finder. It:
+Double-click `launch.command` in Finder. It opens a GUI window titled "Augur" and immediately:
 1. Cleans up raw screenpipe files older than 7 days (`~/.screenpipe/data/`)
 2. Starts screenpipe if not running (waits up to 15s for startup)
 3. Starts the Context API server on port 3031 (background subprocess)
 4. Starts the semantic indexer if chromadb + sentence-transformers are installed
 5. Checks LM Studio (warns if offline, non-blocking)
-6. Opens the dashboard in your browser
-7. Prints live status every 10s: `[screenpipe: up] [context-api: up] [semantic: up] [LM Studio: up]`
+6. Opens the dashboard in Chrome automatically
 
-Press `Ctrl+C` to stop the launcher. screenpipe and the context server keep running.
+The GUI window shows live status indicators for all 4 services and provides Start/Stop Screenpipe controls. Closing the window does not kill background services — screenpipe and the context server keep running.
 
 ### Option B: Manual
 
@@ -348,7 +346,7 @@ python3 test_features.py --live
 ```
 nomenclator/
 +-- screenpipe-dashboard.html   # Full browser dashboard (single self-contained HTML file)
-+-- launch.command              # Double-click launcher — starts everything
++-- launch.command              # Double-click launcher — opens Augur GUI app with service status + start/stop controls
 +-- context-server.py           # Context API server (port 3031) — the core product
 +-- demo_agent.py               # Agent integration demo (LM Studio, Claude, OpenAI)
 +-- semantic_search.py          # Chroma vector store indexer + semantic query engine
@@ -480,6 +478,14 @@ Grant permissions in System Settings → Privacy & Security:
 - [x] MCP server — native integration with Claude Desktop, Cursor, and MCP-compatible agents
 - [x] `/profile` + `/context-card` endpoints
 - [x] Dashboard: Browser Activity tab + semantic search mode toggle
+
+### v0.3.1 (shipped)
+- [x] GUI launcher — double-clicking `launch.command` opens a native window with service status + Start/Stop controls (no more terminal window)
+- [x] Fixed context window overflow — AI chat no longer errors with large screenpipe datasets
+- [x] Full branding pass — app UI renamed from "screenpipe" to "Augur" throughout
+- [x] Sidebar cleanup — removed Stop Screenpipe and Today's Summary buttons; auto-refresh ON by default
+- [x] Ask AI UX — fixed-height scrollable chat; input always visible; tab moved next to Live Feed
+- [x] Browser Captures tab fixed — loads and displays all captured fields
 
 ---
 
