@@ -95,7 +95,21 @@ cd nomenclator
 chmod +x launch.command
 ```
 
-### 4. (Optional) Install semantic search dependencies
+### 4. Install GUI launcher support (required for the Augur window)
+
+The launcher opens a native GUI window. This requires Python's Tk bindings, which Homebrew Python does not include by default:
+
+```bash
+# Find your Python version
+python3 --version
+
+# Install matching tkinter support (replace 3.14 with your version)
+brew install python-tk@3.14
+```
+
+Without this, the launcher falls back to terminal mode and still works — but you won't get the GUI window.
+
+### 6. (Optional) Install semantic search dependencies
 
 For vector-based semantic search, install:
 ```bash
@@ -104,7 +118,7 @@ pip install chromadb sentence-transformers
 
 This enables the **Semantic** search mode in the dashboard and improves context ranking quality. Without it, keyword scoring still works fully.
 
-### 5. (Optional) Install cloud LLM backends
+### 7. (Optional) Install cloud LLM backends
 
 For the `demo_agent.py` cloud backends:
 ```bash
@@ -112,7 +126,7 @@ pip install anthropic   # for --api claude
 pip install openai      # for --api openai
 ```
 
-### 6. (Optional) Set up LM Studio
+### 8. (Optional) Set up LM Studio
 
 Download [LM Studio](https://lmstudio.ai), then:
 1. Go to the **Local Server** tab

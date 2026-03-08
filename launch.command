@@ -22,9 +22,13 @@ import threading
 import importlib
 from pathlib import Path
 from datetime import datetime, timedelta
-import tkinter as tk
-from tkinter import ttk
-from tkinter import scrolledtext
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from tkinter import scrolledtext
+    _HAS_TKINTER = True
+except ImportError:
+    _HAS_TKINTER = False
 
 # ── Config ─────────────────────────────────────────────────────────
 SCREENPIPE_BIN   = os.path.expanduser("~/bin/screenpipe")
@@ -121,6 +125,128 @@ def start_semantic_indexer():
         return True, proc.pid
     except Exception as e:
         return False, str(e)
+
+
+# ── Terminal fallback (when tkinter is not available) ─────────────────
+def run_terminal_mode():
+    """Original terminal-based launcher, used when tkinter/_tkinter is missing."""
+    print()
+    print("  ┌─────────────────────────────────────┐")
+    print("  │              Augur                   │")
+    print("  │      personal context layer          │")
+    print("  └─────────────────────────────────────┘")
+    print()
+    print("  (GUI mode unavailable — tkinter not installed for this Python)")
+    print("  To enable GUI: brew install python-tk@3.14")
+    print()
+
+    def tlog(msg):
+        print(msg)
+
+    def ps(msg, ok=True):
+        tlog(f"  {'✓' if ok else '✗'}  {msg}")
+
+    # 0. Cleanup
+    tlog("  ⟳  Cleaning up old screenpipe files...")
+    data_dir = Path.home() / ".screenpipe" / "data"
+    if data_dir.exists():
+        cutoff = datetime.now() - timedelta(days=CLEANUP_DAYS)
+        freed, count = 0, 0
+        for f in data_dir.glob("*"):
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff.timestamp():
+                    freed += f.stat().st_size; f.unlink(); count += 1
+            except Exception:
+                pass
+        if freed > 0:
+            tlog(f"  [cleanup] freed {freed/1e6:.1f} MB ({count} files)")
+
+    # 1. screenpipe binary
+    if not os.path.exists(SCREENPIPE_BIN):
+        ps(f"screenpipe binary not found at {SCREENPIPE_BIN}", ok=False)
+        input("\n  Press Enter to exit...")
+        sys.exit(1)
+
+    # 2. Start screenpipe
+    if is_port_open(SCREENPIPE_PORT):
+        ps("screenpipe already running on port 3030")
+    else:
+        tlog("  ⟳  Starting screenpipe...")
+        try:
+            lf = open(os.path.expanduser("~/.screenpipe/launcher.log"), "a")
+            subprocess.Popen([SCREENPIPE_BIN], stdout=lf, stderr=lf, start_new_session=True)
+        except Exception as e:
+            ps(f"Failed to start screenpipe: {e}", ok=False); sys.exit(1)
+        print("  ⟳  Waiting for screenpipe", end="", flush=True)
+        for _ in range(CHECK_RETRIES):
+            time.sleep(RETRY_DELAY); print(".", end="", flush=True)
+            if is_port_open(SCREENPIPE_PORT): print(); ps("screenpipe started"); break
+        else:
+            print(); ps("screenpipe didn't start in time", ok=False)
+
+    # 3. Context API
+    print()
+    if is_port_open(CONTEXT_PORT):
+        ps("Context API already running on port 3031")
+    elif os.path.exists(CONTEXT_SERVER):
+        tlog("  ⟳  Starting Augur Context API (port 3031)...")
+        try:
+            lf = open(os.path.expanduser("~/.screenpipe/launcher.log"), "a")
+            subprocess.Popen([sys.executable, CONTEXT_SERVER], stdout=lf, stderr=lf, start_new_session=True)
+            time.sleep(1.5)
+            ps("Context API started" if is_port_open(CONTEXT_PORT) else "Context API starting...")
+        except Exception as e:
+            ps(f"Failed to start Context API: {e}", ok=False)
+
+    # 4. Semantic indexer
+    print()
+    if is_semantic_running():
+        ps("Semantic indexer already running")
+    elif is_semantic_available() and os.path.exists(SEMANTIC_INDEXER):
+        tlog("  ⟳  Starting Augur Semantic Indexer...")
+        ok, info = start_semantic_indexer()
+        if ok:
+            time.sleep(1.5)
+            ps(f"Semantic indexer started (PID {info})" if is_semantic_running() else "Semantic indexer starting...")
+        else:
+            ps(f"Failed to start semantic indexer: {info}", ok=False)
+    else:
+        ps("Semantic indexer not available (pip install chromadb sentence-transformers)", ok=False)
+
+    # 5. LM Studio
+    print()
+    if is_port_open(LM_STUDIO_PORT):
+        ps("LM Studio running on port 1234")
+    else:
+        ps("LM Studio NOT detected on port 1234", ok=False)
+        tlog("  Open LM Studio → Local Server → Start Server to enable AI chat.")
+
+    # 6. Open dashboard
+    print()
+    if not os.path.exists(DASHBOARD_PATH):
+        ps(f"Dashboard not found: {DASHBOARD_PATH}", ok=False); sys.exit(1)
+    tlog("  ⟳  Opening dashboard in browser...")
+    time.sleep(0.5)
+    webbrowser.open(f"file://{DASHBOARD_PATH}")
+    ps("Dashboard opened")
+    print()
+    print("  ┌─────────────────────────────────────┐")
+    print("  │  All systems go. Press Ctrl+C to    │")
+    print("  │  stop this window (services keep    │")
+    print("  │  running in the background).        │")
+    print("  └─────────────────────────────────────┘")
+    print()
+
+    try:
+        while True:
+            time.sleep(10)
+            sp = is_port_open(SCREENPIPE_PORT); ctx = is_port_open(CONTEXT_PORT)
+            sem = is_semantic_running(); lm = is_port_open(LM_STUDIO_PORT)
+            print(f"\r  [screenpipe: {'up' if sp else 'DOWN'}]  [context-api: {'up' if ctx else 'down'}]"
+                  f"  [semantic: {'up' if sem else 'down'}]  [LM Studio: {'up' if lm else 'not running'}]    ",
+                  end="", flush=True)
+    except KeyboardInterrupt:
+        print("\n\n  Launcher closed. Services continue running in background.\n")
 
 
 # ── GUI globals ──────────────────────────────────────────────────────
@@ -477,4 +603,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if not _HAS_TKINTER:
+        run_terminal_mode()
+    else:
+        main()
