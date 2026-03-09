@@ -1834,7 +1834,11 @@ function switchTab(name, el) {
   document.getElementById('timelineTab').style.display = name === 'timeline' ? 'flex' : 'none';
   document.getElementById('anomaliesTab').style.display = name === 'anomalies' ? 'flex' : 'none';
   document.getElementById('browserTab').style.display = name === 'browser' ? 'flex' : 'none';
-  if (name === 'ai') setTimeout(() => document.getElementById('aiInput').focus(), 100);
+  if (name === 'ai') setTimeout(() => {
+    document.getElementById('aiInput').focus();
+    const msgs = document.getElementById('aiMessages');
+    msgs.scrollTop = msgs.scrollHeight;
+  }, 50);
   if (name === 'timeline') loadTimeline();
   if (name === 'anomalies') loadAnomalies();
   if (name === 'browser') loadBrowserActivity();
@@ -2056,7 +2060,7 @@ async function getScreenpipeContext(question) {
     }
 
     if (rawChunks.length === 0) {
-      return { context: '\n\n[No recent screen data available for this query.]', fallback };
+      return { context: '\n\n[No recent screen data available for this query.]', fallback, captureCount: 0 };
     }
 
     // Token-based budget
@@ -2086,27 +2090,26 @@ async function getScreenpipeContext(question) {
     block += positioned.join(separator);
     block += '\n\n--- END CONTEXT ---';
 
-    return { context: block, fallback };
+    return { context: block, fallback, captureCount: positioned.length };
 
   } catch (e) {
-    return { context: '', fallback: true };
+    return { context: '', fallback: true, captureCount: 0 };
   }
 }
 
 async function generateAnswer(question, context, fallback) {
-  const systemPrompt = `You are Augur, an AI assistant. You answer ONLY from screen capture evidence in the [Screen context] block provided below.
+  const systemPrompt = `You are Augur, a personal context assistant. Answer questions using the screen capture evidence in [Screen context] below.
 
-STRICT RULES:
-1. Every factual claim must be grounded in a specific context entry. Cite it as: (App: X, Window: Y, Time: HH:MM).
-2. If the context does not contain enough evidence, say EXACTLY: "I don't see that in your recent screen data." Do not guess, infer, or fill in gaps.
-3. Do not reference apps, files, URLs, code, or content that does not appear in the context block.
-4. "Recent" means what is in the context block — not what you know from training.
-5. If asked to summarize multiple items, only summarize what appears in the context. Do not pad with generalities.` + (userProfileCard ? '\n\n' + userProfileCard : '');
+RULES:
+1. Ground your answer in the context. Cite evidence as: (App: X, Window: Y, Time: HH:MM).
+2. Answer confidently from what you observe. If specific details are absent, summarize what IS visible and note any gaps naturally in your response.
+3. Do not invent or hallucinate details that are not in the context.
+4. "Recent" means the context block below — not your training knowledge.
+5. Keep answers focused and direct.` + (userProfileCard ? '\n\n' + userProfileCard : '');
 
-  // Context is always fresh — fetched above for this specific question
   const systemTurn = { role: 'user', content: `${systemPrompt}\n\n[Screen context]\n${context}` };
   const systemAck  = { role: 'assistant', content: 'Understood. I have your screen context. Ready to help.' };
-  const historyMessages = chatHistory.slice(-6);   // last 3 conversation pairs
+  const historyMessages = chatHistory.slice(-6);
   const messages = [
     systemTurn,
     systemAck,
@@ -2114,9 +2117,9 @@ STRICT RULES:
     { role: 'user', content: question }
   ];
 
-  let r;
+  let responseText;
   try {
-    r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
+    const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2124,88 +2127,39 @@ STRICT RULES:
         messages,
         max_tokens: 1000,
         temperature: 0.15,
-        stream: true
+        stream: false
       })
     });
+
+    if (!r.ok) {
+      removeTyping();
+      const hint = r.status === 400
+        ? 'Prompt exceeds context window. In LM Studio → Local Server, increase "Context Length" to 8192+.'
+        : `LM Studio returned HTTP ${r.status}.`;
+      appendMsg('ai', `**Error:** ${hint}`);
+      return;
+    }
+
+    const data = await r.json();
+    responseText = data.choices?.[0]?.message?.content?.trim();
+
   } catch(e) {
     removeTyping();
     appendMsg('ai', `**Could not reach LM Studio.** ${e.message}`);
     return;
   }
 
-  if (!r.ok) {
-    removeTyping();
-    const hint = r.status === 400
-      ? 'The prompt may exceed your model\'s context window. In LM Studio → Local Server, increase "Context Length" to 8192 or higher.'
-      : `LM Studio returned ${r.status}`;
-    appendMsg('ai', `**Error:** ${hint}`);
+  removeTyping();
+
+  if (!responseText) {
+    appendMsg('ai', '*(No response from model — try reloading the model in LM Studio.)*');
     return;
   }
 
-  // Remove typing indicator and create the AI bubble immediately (empty)
-  removeTyping();
-  const msgs = document.getElementById('aiMessages');
-  const time = new Date().toLocaleTimeString();
-  const aiDiv = document.createElement('div');
-  aiDiv.className = 'msg ai';
-  aiDiv.innerHTML = `
-    <div class="msg-avatar">AI</div>
-    <div>
-      <div class="msg-bubble"></div>
-      <div class="msg-time">${time}</div>
-    </div>`;
-  msgs.appendChild(aiDiv);
-  msgs.scrollTop = msgs.scrollHeight;
-  const bubble = aiDiv.querySelector('.msg-bubble');
-
-  let fullText = '';
-  try {
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = decoder.decode(value, { stream: true });
-      for (const line of chunk.split('\n')) {
-        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
-        try {
-          const token = JSON.parse(line.slice(6))?.choices?.[0]?.delta?.content || '';
-          if (token) {
-            fullText += token;
-            // Render incrementally using the same formatting as appendMsg
-            const formatted = fullText
-              .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-              .replace(/`(.*?)`/g, '<code>$1</code>')
-              .split('\n').filter(l => l.trim()).map(l => `<p>${l}</p>`).join('');
-            bubble.innerHTML = formatted;
-            msgs.scrollTop = msgs.scrollHeight;
-          }
-        } catch(e) {}
-      }
-    }
-  } catch(e) {
-    if (!fullText) {
-      bubble.innerHTML = `<strong>Stream error:</strong> ${e.message}`;
-      return;
-    }
-    // Partial content — keep what we have
-  }
-
-  if (!fullText) fullText = 'No response from model.';
-
-  // Persist to localStorage (same logic as appendMsg)
-  if (!_suppressPersist) {
-    try {
-      const stored = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || '[]');
-      stored.push({ role: 'ai', text: fullText, time });
-      if (stored.length > CHAT_MAX_MESSAGES) stored.splice(0, stored.length - CHAT_MAX_MESSAGES);
-      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(stored));
-    } catch(e) {}
-  }
+  appendMsg('ai', responseText);
 
   chatHistory.push({ role: 'user', content: question });
-  chatHistory.push({ role: 'assistant', content: fullText });
+  chatHistory.push({ role: 'assistant', content: responseText });
 }
 
 async function handleCRAGFail(question, rewrite) {
@@ -2236,31 +2190,23 @@ async function sendAI() {
   input.style.height = 'auto';
   document.getElementById('suggestions').style.display = 'none';
   appendMsg('user', question);
-  showTyping();
   isThinking = true;
   document.getElementById('sendBtn').disabled = true;
 
   try {
-    const { context, fallback } = await getScreenpipeContext(question);
+    showTypingLabel('Searching screen captures...');
+    const { context, fallback, captureCount } = await getScreenpipeContext(question);
 
-    // CRAG gate
-    if (context.length > 0) {
-      const { relevant, rewrite } = await gradeContext(question, context);
-      if (!relevant) {
-        await handleCRAGFail(question, rewrite);
-        isThinking = false;
-        document.getElementById('sendBtn').disabled = false;
-        document.getElementById('aiInput').focus();
-        return;
-      }
-    }
+    const ctxNote = captureCount > 0
+      ? `Found ${captureCount} capture${captureCount !== 1 ? 's' : ''} — thinking...`
+      : fallback ? 'Context server offline — thinking...' : 'No captures found — thinking...';
+    showTypingLabel(ctxNote);
 
-    // Proceed to generation
     await generateAnswer(question, context, fallback);
 
   } catch(e) {
     removeTyping();
-    appendMsg('ai', `Could not generate a response — context was too large or LM Studio is unavailable. If this persists, increase Context Length to 8192+ in LM Studio → Local Server settings.`);
+    appendMsg('ai', `**Error:** ${e.message}`);
   }
 
   isThinking = false;
@@ -2312,6 +2258,7 @@ function loadPersistedChat() {
     _suppressPersist = true;
     stored.forEach((m, i) => appendMsg(m.role, m.text, i === 0));
     _suppressPersist = false;
+    requestAnimationFrame(() => { msgs.scrollTop = msgs.scrollHeight; });
   } catch(e) {
     _suppressPersist = false;
   }
@@ -2364,7 +2311,7 @@ function showTypingLabel(label) {
       <div class="typing-indicator">
         <div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>
       </div>
-      <span style="font-size:10px;color:var(--dimmer);margin-left:6px">${label}</span>
+      <span style="font-size:11px;color:var(--text);margin-left:8px;opacity:0.75">${label}</span>
     </div></div>`;
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
