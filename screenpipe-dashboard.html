@@ -2210,6 +2210,16 @@ async function sendAI() {
   const question = input.value.trim();
   if (!question) return;
 
+  // Recheck LM Studio on every send — handles case where it came online after page load
+  if (!loadedModel) await detectLMStudio();
+  if (!loadedModel) {
+    appendMsg('user', question);
+    input.value = '';
+    input.style.height = 'auto';
+    appendMsg('ai', '**LM Studio is offline.** Open LM Studio → Local Server → load a model → click Start Server, then try again.');
+    return;
+  }
+
   input.value = '';
   input.style.height = 'auto';
   document.getElementById('suggestions').style.display = 'none';
