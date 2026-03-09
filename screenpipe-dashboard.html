@@ -1615,6 +1615,8 @@ async function loadFeed() {
     totalRecords = d.pagination?.total || 0;
     document.getElementById('statTotal').textContent = totalRecords;
 
+    _liveFeedCache = d.data || []; // keep in sync for AI context
+
     const frames = d.data?.filter(x => x.type === 'OCR').length || 0;
     const audio = d.data?.filter(x => x.type === 'Audio').length || 0;
     document.getElementById('statFrames').textContent = frames;
@@ -1913,6 +1915,7 @@ let aiContext = 'none';
 let chatHistory = [];
 let isThinking = false;
 let userProfileCard = '';
+let _liveFeedCache = []; // always-current screen captures, updated every 5s
 
 async function loadUserProfileCard() {
   try {
@@ -2059,8 +2062,29 @@ async function getScreenpipeContext(question) {
       });
     }
 
-    if (rawChunks.length === 0) {
-      return { context: '\n\n[No recent screen data available for this query.]', fallback, captureCount: 0 };
+    // Build live feed chunks from the always-current cache (independent of query)
+    const liveChunks = _liveFeedCache.slice(0, 20).map(item => {
+      const c = item.content || {};
+      const time = c.timestamp ? new Date(c.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+      const isOCR = item.type === 'OCR';
+      const appLine = isOCR
+        ? `App: ${c.app_name || 'unknown'} | Window: ${(c.window_name || '').slice(0, 60)}`
+        : `App: audio | Window: ${(c.device_name || '').slice(0, 60)}`;
+      const text = ((isOCR ? c.text : c.transcription) || '').slice(0, 400);
+      return `[${time}] [${isOCR ? 'OCR' : 'AUDIO'}] ${appLine}\n${text}`;
+    });
+
+    // Merge: live feed first (real-time), then query-ranked (relevant history)
+    // Deduplicate by first-50-char fingerprint so identical captures don't appear twice
+    const seenKeys = new Set();
+    const allChunks = [];
+    for (const chunk of [...liveChunks, ...rawChunks]) {
+      const key = chunk.slice(0, 50);
+      if (!seenKeys.has(key)) { seenKeys.add(key); allChunks.push(chunk); }
+    }
+
+    if (allChunks.length === 0) {
+      return { context: '\n\n[No recent screen data available.]', fallback, captureCount: 0 };
     }
 
     // Token-based budget
@@ -2072,10 +2096,9 @@ async function getScreenpipeContext(question) {
     const BUDGET_CHARS       = Math.max(2000, Math.min(12000, availableTokens * 4));
 
     const separator = '\n\n---\n\n';
-    // Trim chunks to budget
     const trimmed = [];
     let used = 0;
-    for (const chunk of rawChunks) {
+    for (const chunk of allChunks) {
       if (used + chunk.length + separator.length > BUDGET_CHARS) break;
       trimmed.push(chunk);
       used += chunk.length + separator.length;
@@ -2086,7 +2109,8 @@ async function getScreenpipeContext(question) {
 
     const label = ctxResp?.keywords?.join(', ') || question.slice(0, 60);
     const statusLabel = fallback ? `${label} (fallback mode — context server offline)` : label;
-    let block = `\n\n--- SCREEN CONTEXT (${positioned.length} captures, ranked for: ${statusLabel}) ---\n\n`;
+    const liveCount = Math.min(liveChunks.length, positioned.length);
+    let block = `\n\n--- LIVE SCREEN FEED (${liveCount} current + ${positioned.length - liveCount} relevant captures, query: ${statusLabel}) ---\n\n`;
     block += positioned.join(separator);
     block += '\n\n--- END CONTEXT ---';
 
