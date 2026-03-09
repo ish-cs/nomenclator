@@ -1947,60 +1947,283 @@ function askSuggestion(el) {
   sendAI();
 }
 
+function approxTokens(str) {
+  // Average 4 chars per token for English/code mix
+  return Math.ceil((str || '').length / 4);
+}
+
+function parseTemporalQuery(q) {
+  const lower = q.toLowerCase();
+  if (/\blast\s+week\b/.test(lower))                           return 168;
+  if (/\byesterday\b/.test(lower))                             return 48;
+  if (/\blast\s+month\b/.test(lower))                          return 720;
+  if (/\bthis\s+morning\b/.test(lower))                        return 14;
+  if (/\bthis\s+afternoon\b/.test(lower))                      return 10;
+  if (/\btonight\b|\bthis\s+evening\b/.test(lower))           return 6;
+  const hoursMatch = lower.match(/last\s+(\d+)\s+hours?/);
+  if (hoursMatch)   return parseInt(hoursMatch[1], 10) + 2;
+  const daysMatch  = lower.match(/last\s+(\d+)\s+days?/);
+  if (daysMatch)    return parseInt(daysMatch[1], 10) * 24;
+  return 24; // default
+}
+
+function positionOptimize(chunks) {
+  if (chunks.length <= 2) return chunks;
+  const first = chunks[0];
+  const last  = chunks[chunks.length - 1];
+  const middle = chunks.slice(1, -1); // already descending by score
+  // Put best at top, second-best at bottom, rest in middle
+  return [first, ...middle, last];
+}
+
+async function gradeContext(question, contextBlock) {
+  // Don't grade if no context was retrieved — handled upstream
+  if (!contextBlock || contextBlock.trim().length < 80) return { relevant: false, rewrite: null };
+
+  const gradePrompt =
+`You are a strict relevance grader for a screen activity assistant.
+
+Question: ${question}
+
+Retrieved screen data (first 1500 chars):
+${contextBlock.slice(0, 1500)}
+
+Does this screen data contain specific, direct evidence to answer the question?
+Respond with exactly one word on line 1: YES or NO.
+If NO, write a better search query on line 2 (max 8 words).`;
+
+  try {
+    const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: loadedModel || undefined,
+        messages: [{ role: 'user', content: gradePrompt }],
+        max_tokens: 20,
+        temperature: 0.0,
+        stream: false
+      })
+    });
+    if (!r.ok) return { relevant: true, rewrite: null }; // fail open
+
+    const d = await r.json();
+    const lines = (d.choices?.[0]?.message?.content || '').trim().split('\n');
+    const verdict = lines[0].trim().toUpperCase();
+    const rewrite = lines[1]?.trim() || null;
+    return { relevant: verdict.startsWith('YES'), rewrite };
+  } catch(e) {
+    return { relevant: true, rewrite: null }; // fail open on error
+  }
+}
+
 async function getScreenpipeContext(question) {
   try {
+    const windowHours = parseTemporalQuery(question);
+
     // Primary: use context-server.py hybrid ranking (keyword + semantic + browser)
     const ctxResp = await fetch(
-      `http://localhost:3031/context?q=${encodeURIComponent(question)}&limit=12&window_hours=24`
+      `http://localhost:3031/context?q=${encodeURIComponent(question)}&limit=12&window_hours=${windowHours}`
     ).then(r => r.json()).catch(() => null);
 
-    let frames = [];
+    let rawChunks = [];
+    let fallback = false;
 
     if (ctxResp && ctxResp.results && ctxResp.results.length > 0) {
       // Use hybrid-ranked results from context-server.py
-      frames = ctxResp.results.map(r => {
-        const time = r.timestamp ? new Date(r.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
-        const src  = r.source === 'browser' ? `Browser / ${(r.window || r.url || '').slice(0, 60)}` : `${r.app || '?'} / ${(r.window || '').slice(0, 50)}`;
-        const text = (r.text || '').slice(0, 400);
-        return `[${time}] [${src}]\n${text}`;
+      rawChunks = ctxResp.results.map(item => {
+        const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+        const urlNote = item.url ? `\n  URL: ${item.url.slice(0, 100)}` : '';
+        const appLine = `App: ${item.app || 'unknown'} | Window: ${(item.window || '').slice(0, 60)}`;
+        const text = (item.text || '').slice(0, 400);
+        return `[${time}] [${(item.source || 'ocr').toUpperCase()}] ${appLine}${urlNote}\n${text}`;
       });
     } else {
       // Fallback: direct screenpipe (context-server offline)
+      fallback = true;
       const recent = await fetch(`${API}/search?limit=20`).then(r => r.json()).catch(() => ({ data: [] }));
       const allItems = recent.data || [];
       allItems.sort((a, b) => new Date(b.content?.timestamp || 0) - new Date(a.content?.timestamp || 0));
-      frames = allItems.slice(0, 12).map(item => {
+      rawChunks = allItems.slice(0, 12).map(item => {
         const c = item.content;
         const time = c.timestamp ? new Date(c.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
         const isOCR = item.type === 'OCR';
-        const src = isOCR ? `${c.app_name || '?'} / ${(c.window_name || '').slice(0, 50)}` : 'audio';
+        const appLine = isOCR
+          ? `App: ${c.app_name || 'unknown'} | Window: ${(c.window_name || '').slice(0, 60)}`
+          : `App: audio | Window: ${(c.device_name || '').slice(0, 60)}`;
         const text = ((isOCR ? c.text : c.transcription) || '').slice(0, 400);
-        return `[${time}] [${src}]\n${text}`;
+        return `[${time}] [${isOCR ? 'OCR' : 'AUDIO'}] ${appLine}\n${text}`;
       });
     }
 
-    if (frames.length === 0) {
-      return '\n\n[No recent screen data available for this query.]';
+    if (rawChunks.length === 0) {
+      return { context: '\n\n[No recent screen data available for this query.]', fallback };
     }
 
-    // Dynamic budget: leave room for chat history + response
-    const historyChars = chatHistory.slice(-6).reduce((n, m) => n + (m.content || '').length, 0);
-    const budget = Math.max(1500, Math.min(4000, 5500 - historyChars));
+    // Token-based budget
+    const MODEL_CTX_TOKENS   = 8192;
+    const RESPONSE_RESERVE   = 1000;
+    const SYSTEM_RESERVE     = 300;
+    const historyTokens      = chatHistory.slice(-6).reduce((n, m) => n + approxTokens(m.content), 0);
+    const availableTokens    = MODEL_CTX_TOKENS - RESPONSE_RESERVE - SYSTEM_RESERVE - historyTokens;
+    const BUDGET_CHARS       = Math.max(2000, Math.min(12000, availableTokens * 4));
+
+    const separator = '\n\n---\n\n';
+    // Trim chunks to budget
+    const trimmed = [];
+    let used = 0;
+    for (const chunk of rawChunks) {
+      if (used + chunk.length + separator.length > BUDGET_CHARS) break;
+      trimmed.push(chunk);
+      used += chunk.length + separator.length;
+    }
+
+    // Position optimization: best first, second-best last, rest middle
+    const positioned = positionOptimize(trimmed);
 
     const label = ctxResp?.keywords?.join(', ') || question.slice(0, 60);
-    const statusLabel = ctxResp ? label : `${label} (fallback mode — context server offline)`;
-    let block = `\n\n--- SCREEN CONTEXT (${frames.length} captures, ranked for: ${statusLabel}) ---\n\n`;
-    block += frames.join('\n\n---\n\n');
+    const statusLabel = fallback ? `${label} (fallback mode — context server offline)` : label;
+    let block = `\n\n--- SCREEN CONTEXT (${positioned.length} captures, ranked for: ${statusLabel}) ---\n\n`;
+    block += positioned.join(separator);
     block += '\n\n--- END CONTEXT ---';
 
-    if (block.length > budget) {
-      block = block.slice(0, budget) + '\n[...context trimmed to fit model window]';
-    }
-    return block;
+    return { context: block, fallback };
 
   } catch (e) {
-    return '';
+    return { context: '', fallback: true };
   }
+}
+
+async function generateAnswer(question, context, fallback) {
+  const systemPrompt = `You are Augur, an AI assistant. You answer ONLY from screen capture evidence in the [Screen context] block provided below.
+
+STRICT RULES:
+1. Every factual claim must be grounded in a specific context entry. Cite it as: (App: X, Window: Y, Time: HH:MM).
+2. If the context does not contain enough evidence, say EXACTLY: "I don't see that in your recent screen data." Do not guess, infer, or fill in gaps.
+3. Do not reference apps, files, URLs, code, or content that does not appear in the context block.
+4. "Recent" means what is in the context block — not what you know from training.
+5. If asked to summarize multiple items, only summarize what appears in the context. Do not pad with generalities.` + (userProfileCard ? '\n\n' + userProfileCard : '');
+
+  // Context is always fresh — fetched above for this specific question
+  const systemTurn = { role: 'user', content: `${systemPrompt}\n\n[Screen context]\n${context}` };
+  const systemAck  = { role: 'assistant', content: 'Understood. I have your screen context. Ready to help.' };
+  const historyMessages = chatHistory.slice(-6);   // last 3 conversation pairs
+  const messages = [
+    systemTurn,
+    systemAck,
+    ...historyMessages,
+    { role: 'user', content: question }
+  ];
+
+  let r;
+  try {
+    r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: loadedModel || undefined,
+        messages,
+        max_tokens: 1000,
+        temperature: 0.15,
+        stream: true
+      })
+    });
+  } catch(e) {
+    removeTyping();
+    appendMsg('ai', `**Could not reach LM Studio.** ${e.message}`);
+    return;
+  }
+
+  if (!r.ok) {
+    removeTyping();
+    const hint = r.status === 400
+      ? 'The prompt may exceed your model\'s context window. In LM Studio → Local Server, increase "Context Length" to 8192 or higher.'
+      : `LM Studio returned ${r.status}`;
+    appendMsg('ai', `**Error:** ${hint}`);
+    return;
+  }
+
+  // Remove typing indicator and create the AI bubble immediately (empty)
+  removeTyping();
+  const msgs = document.getElementById('aiMessages');
+  const time = new Date().toLocaleTimeString();
+  const aiDiv = document.createElement('div');
+  aiDiv.className = 'msg ai';
+  aiDiv.innerHTML = `
+    <div class="msg-avatar">AI</div>
+    <div>
+      <div class="msg-bubble"></div>
+      <div class="msg-time">${time}</div>
+    </div>`;
+  msgs.appendChild(aiDiv);
+  msgs.scrollTop = msgs.scrollHeight;
+  const bubble = aiDiv.querySelector('.msg-bubble');
+
+  let fullText = '';
+  try {
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      for (const line of chunk.split('\n')) {
+        if (!line.startsWith('data: ') || line === 'data: [DONE]') continue;
+        try {
+          const token = JSON.parse(line.slice(6))?.choices?.[0]?.delta?.content || '';
+          if (token) {
+            fullText += token;
+            // Render incrementally using the same formatting as appendMsg
+            const formatted = fullText
+              .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+              .replace(/`(.*?)`/g, '<code>$1</code>')
+              .split('\n').filter(l => l.trim()).map(l => `<p>${l}</p>`).join('');
+            bubble.innerHTML = formatted;
+            msgs.scrollTop = msgs.scrollHeight;
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    if (!fullText) {
+      bubble.innerHTML = `<strong>Stream error:</strong> ${e.message}`;
+      return;
+    }
+    // Partial content — keep what we have
+  }
+
+  if (!fullText) fullText = 'No response from model.';
+
+  // Persist to localStorage (same logic as appendMsg)
+  if (!_suppressPersist) {
+    try {
+      const stored = JSON.parse(localStorage.getItem(CHAT_STORAGE_KEY) || '[]');
+      stored.push({ role: 'ai', text: fullText, time });
+      if (stored.length > CHAT_MAX_MESSAGES) stored.splice(0, stored.length - CHAT_MAX_MESSAGES);
+      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(stored));
+    } catch(e) {}
+  }
+
+  chatHistory.push({ role: 'user', content: question });
+  chatHistory.push({ role: 'assistant', content: fullText });
+}
+
+async function handleCRAGFail(question, rewrite) {
+  if (rewrite && rewrite.length > 5) {
+    // One retry with rewritten query
+    showTypingLabel('Refining search...');
+    const { context: context2 } = await getScreenpipeContext(rewrite);
+    const { relevant: relevant2 } = await gradeContext(rewrite, context2);
+
+    if (relevant2) {
+      // Proceed to generation with context2 and original question
+      await generateAnswer(question, context2, false);
+      return;
+    }
+  }
+  // Both attempts failed — hard refuse
+  removeTyping();
+  appendMsg('ai', "I don't see that in your recent screen data. Try rephrasing or check the Timeline tab for a visual overview.");
 }
 
 async function sendAI() {
@@ -2018,53 +2241,22 @@ async function sendAI() {
   document.getElementById('sendBtn').disabled = true;
 
   try {
-    const contextBlock = await getScreenpipeContext(question);
-    
-    const systemPrompt = `You are Augur AI — a personal assistant with access to the user's screen capture data (OCR screenshots and audio transcriptions captured by screenpipe).
+    const { context, fallback } = await getScreenpipeContext(question);
 
-RULES — follow these strictly:
-1. Ground every answer in the provided SCREEN CONTEXT. Do not invent activities, apps, code, or content not present in the context.
-2. When context supports the answer: be specific. Reference exact app names, window titles, timestamps, and text visible on screen.
-3. When the context does NOT contain enough information to answer, say exactly: "I don't see that in your recent screen data."
-4. For factual/general questions unrelated to screen activity: answer from knowledge and state "From general knowledge:".
-5. Use **bold** for key facts. No markdown headers. Concise answers only.${userProfileCard ? '\n\n' + userProfileCard : ''}`;
-
-    // Context is always fresh — fetched above for this specific question
-    const systemTurn = { role: 'user', content: `${systemPrompt}\n\n${contextBlock}` };
-    const systemAck  = { role: 'assistant', content: 'Understood. I have your screen context. Ready to help.' };
-    const historyMessages = chatHistory.slice(-6);   // last 3 conversation pairs
-    const messages = [
-      systemTurn,
-      systemAck,
-      ...historyMessages,
-      { role: 'user', content: question }
-    ];
-
-    const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: loadedModel || undefined,
-        messages,
-        max_tokens: 800,
-        temperature: 0.7,
-        stream: false
-      })
-    });
-
-    if (!r.ok) {
-      const hint = r.status === 400
-        ? 'The prompt may exceed your model\'s context window. In LM Studio → Local Server, increase "Context Length" to 8192 or higher.'
-        : `LM Studio returned ${r.status}`;
-      throw new Error(hint);
+    // CRAG gate
+    if (context.length > 0) {
+      const { relevant, rewrite } = await gradeContext(question, context);
+      if (!relevant) {
+        await handleCRAGFail(question, rewrite);
+        isThinking = false;
+        document.getElementById('sendBtn').disabled = false;
+        document.getElementById('aiInput').focus();
+        return;
+      }
     }
-    const d = await r.json();
-    const reply = d.choices?.[0]?.message?.content || 'No response from model.';
 
-    removeTyping();
-    appendMsg('ai', reply);
-    chatHistory.push({ role: 'user', content: question });
-    chatHistory.push({ role: 'assistant', content: reply });
+    // Proceed to generation
+    await generateAnswer(question, context, fallback);
 
   } catch(e) {
     removeTyping();
@@ -2155,6 +2347,24 @@ function showTyping() {
       <div class="typing-indicator">
         <div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>
       </div>
+    </div></div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function showTypingLabel(label) {
+  removeTyping();
+  const msgs = document.getElementById('aiMessages');
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.id = 'typingMsg';
+  div.innerHTML = `
+    <div class="msg-avatar">AI</div>
+    <div><div class="msg-bubble">
+      <div class="typing-indicator">
+        <div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>
+      </div>
+      <span style="font-size:10px;color:var(--dimmer);margin-left:6px">${label}</span>
     </div></div>`;
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
