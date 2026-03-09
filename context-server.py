@@ -14,8 +14,13 @@ Endpoints:
 Usage: python context-server.py
 """
 
+import hashlib
 import json
+import math
 import os
+import re
+import time
+import unicodedata
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -25,8 +30,10 @@ from collections import defaultdict
 # ── Config ─────────────────────────────────────────────────────────
 SCREENPIPE_URL = "http://localhost:3030"
 PORT = 3031
-DEFAULT_LIMIT = 15
+DEFAULT_LIMIT = 25          # P1-D: was 15
 DEFAULT_WINDOW_HOURS = 24
+
+HALF_LIFE_HOURS = 6.0       # P1-C: exponential recency decay half-life
 
 BROWSER_CAPTURES_FILE = os.path.expanduser("~/.screenpipe/browser_captures.json")
 BROWSER_CAPTURES_MAX = 1000   # max entries stored
@@ -45,6 +52,15 @@ STOP_WORDS = frozenset([
 _semantic_embedder   = None   # SentenceTransformer instance or None
 _semantic_collection = None   # Chroma collection or None
 _semantic_available  = None   # None = untested | True | False
+
+# ── Cross-encoder grader (P3-B) ──────────────────────────────────────
+_grader_model = None          # lazy-loaded CrossEncoder
+
+# ── BM25 index (P4-A) ────────────────────────────────────────────────
+_bm25_index    = None
+_bm25_corpus   = []
+_bm25_built_at = 0.0
+BM25_REFRESH_SECS = 120
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -84,6 +100,41 @@ def cors_headers():
         'Access-Control-Allow-Headers': 'Content-Type',
         'Content-Type': 'application/json',
     }
+
+
+# ── P1-A: OCR text cleaning ──────────────────────────────────────────
+def clean_ocr_text(text: str) -> str:
+    if not text:
+        return ''
+    text = unicodedata.normalize('NFC', text)
+    # Strip non-printable chars (keep standard ASCII + accented Latin)
+    text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\u00C0-\u017F]', ' ', text)
+    # Remove decoration runs (borders, dividers: ===, ---, |||)
+    text = re.sub(r'([|=\-_~*#])\1{3,}', ' ', text)
+    # Collapse repeated chars from OCR anti-aliasing ("Saaaave" → "Save")
+    text = re.sub(r'([a-zA-Z])\1{4,}', r'\1\1', text)
+    # Fix obvious split-word artifacts ("D o w n l o a d" → "Download")
+    text = re.sub(r'\b([A-Za-z]) (?=[A-Za-z] [A-Za-z])', r'\1', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ── P1-C: Exponential recency decay ─────────────────────────────────
+def recency_score(age_s: float) -> float:
+    """Exponential decay with 6-hour half-life. Returns 0.0–1.0."""
+    return math.exp(-0.693 * age_s / (HALF_LIFE_HOURS * 3600))
+
+
+# ── P1-G: Multi-query decomposition ─────────────────────────────────
+def decompose_query(query: str, keywords: list) -> list:
+    """Split multi-part queries into sub-queries for broader recall."""
+    parts = re.split(r'\s+(?:and|or|also|plus|as well as)\s+', query.lower())
+    if len(parts) > 1:
+        return [p.strip() for p in parts if len(p.strip()) > 5]
+    if len(keywords) >= 4:
+        return [' '.join(keywords[:3]), ' '.join(keywords[3:])]
+    return [query]
 
 
 # ── Semantic helpers ─────────────────────────────────────────────────
@@ -134,6 +185,155 @@ def _get_semantic_scores(query, n):
         return {}
 
 
+# ── P3-B: Cross-encoder grader ───────────────────────────────────────
+def _get_grader():
+    global _grader_model
+    if _grader_model is None:
+        from sentence_transformers import CrossEncoder as _CE
+        # 22M params, ~60ms/batch on CPU, no GPU needed
+        _grader_model = _CE('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    return _grader_model
+
+
+# ── P4-A: BM25 in-memory index ───────────────────────────────────────
+def _ensure_bm25():
+    global _bm25_index, _bm25_corpus, _bm25_built_at
+    now = time.time()
+    if _bm25_index and (now - _bm25_built_at) < BM25_REFRESH_SECS:
+        return _bm25_index, _bm25_corpus
+
+    data  = fetch_json(f"{SCREENPIPE_URL}/search?limit=500") or {}
+    items = data.get('data', [])
+    corpus = []
+    for item in items:
+        c    = item.get('content', {})
+        text = clean_ocr_text(c.get('text') or c.get('transcription') or '')
+        blob = ' '.join(filter(None, [
+            c.get('app_name', ''), c.get('window_name', ''),
+            c.get('browser_url', ''), text
+        ])).lower()
+        uid  = str(c.get('frame_id') or c.get('timestamp', ''))
+        corpus.append({'uid': uid, 'tokens': blob.split(), 'item': item})
+
+    if corpus:
+        from rank_bm25 import BM25Okapi
+        _bm25_index    = BM25Okapi([e['tokens'] for e in corpus])
+        _bm25_corpus   = corpus
+        _bm25_built_at = now
+
+    return _bm25_index, _bm25_corpus
+
+
+# ── P5-A: ColBERT via RAGatouille ────────────────────────────────────
+_colbert_rag = None
+_colbert_index_built = False
+COLBERT_FRAME_THRESHOLD = 50000
+
+
+def _get_colbert():
+    global _colbert_rag, _colbert_index_built
+    if _colbert_rag is not None:
+        return _colbert_rag
+    try:
+        from ragatouille import RAGPretrainedModel
+        _colbert_rag = RAGPretrainedModel.from_pretrained("colbert-ir/colbertv2.0")
+    except Exception:
+        _colbert_rag = False
+    return _colbert_rag
+
+
+def colbert_retrieve(query: str, docs: list[str], ids: list[str], top_k: int = 15) -> list[dict]:
+    """Run ColBERT retrieval if available and frame count exceeds threshold."""
+    rag = _get_colbert()
+    if not rag:
+        return []
+    try:
+        import tempfile, os
+        index_path = os.path.expanduser("~/.screenpipe/colbert_index")
+        global _colbert_index_built
+        if not _colbert_index_built:
+            rag.index(collection=docs, document_ids=ids,
+                      index_name="augur", max_document_length=256,
+                      overwrite_index=False)
+            _colbert_index_built = True
+        results = rag.search(query, k=top_k)
+        return results
+    except Exception:
+        return []
+
+
+# ── P4-B: RRF merge and hybrid retrieval ────────────────────────────
+def rrf_merge(ranked_lists: list, k: int = 60) -> dict:
+    """Standard RRF. k=60 is the canonical default from the original paper."""
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, uid in enumerate(ranked):
+            scores[uid] = scores.get(uid, 0.0) + 1.0 / (k + rank + 1)
+    return scores
+
+
+def hybrid_retrieve(query: str, existing_candidates: list, top_n: int = 50) -> list:
+    bm25, corpus = _ensure_bm25()
+    if bm25 is None:
+        return existing_candidates[:top_n]
+
+    keywords   = extract_keywords(query)
+    bm25_raw   = bm25.get_scores(keywords)
+    bm25_order = [corpus[i]['uid']
+                  for i in sorted(range(len(bm25_raw)), key=lambda i: -bm25_raw[i])[:top_n]]
+
+    existing_order = [
+        str(i.get('content', {}).get('frame_id') or i.get('content', {}).get('timestamp', ''))
+        for i in sorted(existing_candidates, key=lambda x: -x.get('_score', 0))
+    ]
+
+    merged_scores = rrf_merge([bm25_order, existing_order])
+
+    uid_to_item = {str(i.get('content', {}).get('frame_id') or
+                       i.get('content', {}).get('timestamp', '')): i
+                   for i in existing_candidates}
+    uid_to_bm25 = {e['uid']: e['item'] for e in corpus}
+
+    result, seen = [], set()
+    for uid in sorted(merged_scores, key=merged_scores.get, reverse=True):
+        if uid in seen:
+            continue
+        item = uid_to_item.get(uid) or uid_to_bm25.get(uid)
+        if item:
+            result.append(item)
+            seen.add(uid)
+        if len(result) >= top_n:
+            break
+    return result
+
+
+# ── P4-C: BM25 gate ──────────────────────────────────────────────────
+def query_needs_bm25(keywords: list, query: str) -> bool:
+    """BM25 adds most value for queries with specific technical terms."""
+    specific = any(len(k) > 6 and not k.isdigit() for k in keywords)
+    has_specific_extension = bool(re.search(r'\.\w{2,4}\b', query))
+    return specific or has_specific_extension
+
+
+# ── P5-D: Persistent query cache ─────────────────────────────────────
+_ctx_cache = {}
+CTX_CACHE_TTL = 60
+
+
+def cached_gather_context(query, limit, window_hours, **kwargs):
+    key = hashlib.md5(f"{query}|{limit}|{window_hours}".encode()).hexdigest()
+    if key in _ctx_cache:
+        ts, result = _ctx_cache[key]
+        if time.time() - ts < CTX_CACHE_TTL:
+            return result
+    result = gather_context(query, limit, window_hours, **kwargs)
+    _ctx_cache[key] = (time.time(), result)
+    if len(_ctx_cache) > 100:
+        oldest = min(_ctx_cache, key=lambda k: _ctx_cache[k][0])
+        del _ctx_cache[oldest]
+    return result
+
+
 # ── Browser captures storage ─────────────────────────────────────────
 _browser_captures = []   # in-memory list, loaded from file on start
 
@@ -176,12 +376,15 @@ def browser_capture_to_candidate(cap):
     time_s = int(cap.get('time_on_page_s') or 0)
     scroll = int(cap.get('scroll_depth_pct') or 0)
 
+    # P1-A: apply clean_ocr_text to selected text in blob
+    cleaned_selected = clean_ocr_text(selected)
+
     # Searchable blob: all text fields lowercased
     blob = ' '.join(filter(None, [
         title.lower(),
         domain.lower(),
         url[:200].lower(),
-        selected[:400].lower(),
+        cleaned_selected[:400].lower(),
     ]))
 
     # Stable UID: browser_ prefix guarantees no collision with integer frame_ids
@@ -204,7 +407,8 @@ def browser_capture_to_candidate(cap):
             'timestamp': ts,
             'app': 'Browser',
             'window': (title[:120] if title else url[:120]),
-            'text': (selected[:300] if selected else (title or url[:150])),
+            # P1-A: 500 chars (was 300), use cleaned text
+            'text': (cleaned_selected[:500] if cleaned_selected else (title or url[:150])),
             'url': url,
             'source': 'browser',
         },
@@ -286,19 +490,31 @@ def get_anomalies(days=7):
 
 
 # ── Context gathering ────────────────────────────────────────────────
-def gather_context(query, limit, window_hours):
+def gather_context(query, limit, window_hours, app_filter='', type_filter=''):
     keywords = extract_keywords(query)
 
-    # Fetch recent captures
-    recent_data = fetch_json(f"{SCREENPIPE_URL}/search?limit={limit * 2}") or {}
+    # P1-G: decompose query into sub-queries for broader recall
+    sub_queries = decompose_query(query, keywords)
+
+    # P1-D: Recent fetch limit = limit * 3 (was limit * 2)
+    recent_data = fetch_json(f"{SCREENPIPE_URL}/search?limit={limit * 3}") or {}
     recent_items = recent_data.get('data', [])
 
-    # Fetch per-keyword search results
+    # Fetch per-keyword search results for each sub-query
+    # P1-D: keyword search limit = 30 (was 20)
     kw_items = []
-    for kw in keywords:
-        q = urllib.parse.quote(kw)
-        result = fetch_json(f"{SCREENPIPE_URL}/search?q={q}&limit=20") or {}
-        kw_items.extend(result.get('data', []))
+    seen_kw = set()
+    for sub_q in sub_queries:
+        sub_keywords = extract_keywords(sub_q)
+        if not sub_keywords:
+            sub_keywords = keywords
+        for kw in sub_keywords:
+            if kw in seen_kw:
+                continue
+            seen_kw.add(kw)
+            q = urllib.parse.quote(kw)
+            result = fetch_json(f"{SCREENPIPE_URL}/search?q={q}&limit=30") or {}  # P1-D
+            kw_items.extend(result.get('data', []))
 
     # Deduplicate by frame_id / timestamp
     seen = set()
@@ -347,16 +563,23 @@ def gather_context(query, limit, window_hours):
                 age_s = (now - ts).total_seconds()
             except Exception:
                 age_s = window_ms
-            recency   = max(0.0, 1.0 - age_s / window_ms) if window_ms > 0 else 0.0
+            # P1-C: exponential recency decay (was linear)
+            recency   = recency_score(age_s)
             time_bon  = min(item['_time_on_page_s'] / 300.0, 1.0)
             sel_bon   = 2.0 if item['_has_selection'] else 0.0
-            item['_score'] = kw_score * 3 + recency + time_bon + sel_bon
+            # P1-E: scroll depth bonus and semantic signal for browser
+            scroll_bon = min(item.get('_scroll_pct', 0) / 100.0, 1.0) * 0.5
+            uid_key    = item.get('_uid', '')
+            sem_bonus  = semantic_scores.get(uid_key, 0.0) * 2.0
+            item['_score'] = kw_score * 3 + recency + time_bon + sel_bon + scroll_bon + sem_bonus
         else:
             # Existing OCR/audio scoring
             c = item.get('content', {})
+            # P1-A: apply clean_ocr_text to scoring blob
+            raw_text = c.get('text', '') or c.get('transcription', '') or ''
+            cleaned_text = clean_ocr_text(raw_text)
             blob = ' '.join([
-                c.get('text', '') or '',
-                c.get('transcription', '') or '',
+                cleaned_text,
                 c.get('app_name', '') or '',
                 c.get('window_name', '') or '',
             ]).lower()
@@ -367,13 +590,89 @@ def gather_context(query, limit, window_hours):
                 age_s = (now - ts).total_seconds()
             except Exception:
                 age_s = window_ms
-            recency = max(0.0, 1.0 - age_s / window_ms) if window_ms > 0 else 0.0
+            # P1-C: exponential recency decay (was linear)
+            recency = recency_score(age_s)
             # Semantic bonus: cosine similarity * 2.0 (range 0-2)
             uid_key = str(c.get('frame_id') or c.get('timestamp') or '')
             sem_bonus = semantic_scores.get(uid_key, 0.0) * 2.0
             item['_score'] = kw_score * 3 + recency + sem_bonus
 
     all_items.sort(key=lambda x: x.get('_score', 0), reverse=True)
+
+    # P1-B: Deduplicate by (app_name, window_name), keeping best-scored per window.
+    # Browser items always kept (unique by URL/timestamp).
+    seen_windows = {}
+    deduped = []
+    for item in all_items:
+        if item.get('_source') == 'browser':
+            deduped.append(item)
+            continue
+        c = item.get('content', {})
+        key = (c.get('app_name', ''), c.get('window_name', ''))
+        if key not in seen_windows:
+            seen_windows[key] = True
+            deduped.append(item)
+    all_items = deduped
+
+    # P1-F: Apply app and type filters after deduplication
+    if app_filter:
+        all_items = [i for i in all_items
+                     if app_filter in (i.get('content', {}).get('app_name', '') or '').lower()
+                     or app_filter in (i.get('_result', {}).get('url', '') or '').lower()]
+    if type_filter == 'browser':
+        all_items = [i for i in all_items if i.get('_source') == 'browser']
+    elif type_filter in ('ocr', 'audio'):
+        all_items = [i for i in all_items
+                     if i.get('type', '').lower() == type_filter.upper()
+                     and i.get('_source') != 'browser']
+
+    # P4-C: Use hybrid BM25+vector retrieval only when query warrants it
+    try:
+        if query_needs_bm25(keywords, query):
+            all_items = hybrid_retrieve(query, all_items, top_n=limit * 2)
+    except Exception:
+        pass  # BM25 unavailable or failed — degrade gracefully
+
+    # P5-A: ColBERT retrieval — activates only when collection has >50k frames
+    try:
+        if _semantic_collection is not None and _semantic_collection.count() > COLBERT_FRAME_THRESHOLD:
+            cb_docs, cb_ids = [], []
+            for item in all_items:
+                if item.get('_source') == 'browser':
+                    cb_docs.append(item.get('_blob', ''))
+                    cb_ids.append(item.get('_uid', ''))
+                else:
+                    c = item.get('content', {})
+                    raw = c.get('text', '') or c.get('transcription', '') or ''
+                    cb_docs.append(clean_ocr_text(raw)[:256])
+                    cb_ids.append(str(c.get('frame_id') or c.get('timestamp', '')))
+            if cb_docs:
+                cb_results = colbert_retrieve(query, cb_docs, cb_ids, top_k=15)
+                if cb_results:
+                    cb_uid_order = [r.get('document_id', '') for r in cb_results if r.get('document_id')]
+                    existing_order = [
+                        (item.get('_uid') or str(item.get('content', {}).get('frame_id') or
+                         item.get('content', {}).get('timestamp', '')))
+                        for item in all_items
+                    ]
+                    merged_scores = rrf_merge([cb_uid_order, existing_order])
+                    uid_to_item = {}
+                    for item in all_items:
+                        uid = (item.get('_uid') or str(item.get('content', {}).get('frame_id') or
+                               item.get('content', {}).get('timestamp', '')))
+                        uid_to_item[uid] = item
+                    reranked, seen_cb = [], set()
+                    for uid in sorted(merged_scores, key=merged_scores.get, reverse=True):
+                        if uid in seen_cb:
+                            continue
+                        if uid in uid_to_item:
+                            reranked.append(uid_to_item[uid])
+                            seen_cb.add(uid)
+                    if reranked:
+                        all_items = reranked
+    except Exception:
+        pass  # ColBERT unavailable or failed — degrade gracefully
+
     top = all_items[:limit]
 
     results = []
@@ -386,12 +685,15 @@ def gather_context(query, limit, window_hours):
         else:
             c = item.get('content', {})
             is_ocr = item.get('type') == 'OCR'
+            # P1-A: apply clean_ocr_text and increase text limit 300→500
+            raw_text = (c.get('text') if is_ocr else c.get('transcription')) or ''
+            cleaned_text = clean_ocr_text(raw_text)
             results.append({
                 'frame_id': c.get('frame_id'),
                 'timestamp': c.get('timestamp'),
                 'app': c.get('app_name') if is_ocr else None,
                 'window': c.get('window_name') if is_ocr else None,
-                'text': (c.get('text') if is_ocr else c.get('transcription')) or '',
+                'text': cleaned_text[:500],  # P1-A: 500 chars (was 300)
                 'url': c.get('browser_url'),
                 'score': round(item.get('_score', 0), 3),
                 'source': 'ocr' if is_ocr else 'audio',
@@ -664,10 +966,14 @@ class ContextHandler(BaseHTTPRequestHandler):
             query = p('q', '')
             limit = int(p('limit', DEFAULT_LIMIT))
             window_hours = int(p('window_hours', DEFAULT_WINDOW_HOURS))
+            # P1-F: parse app and type filter params
+            app_filter  = (p('app', '') or '').lower().strip()
+            type_filter = (p('type', '') or '').lower().strip()
             if not query:
                 self.send_json(400, {'error': 'q parameter required'})
                 return
-            result = gather_context(query, limit, window_hours)
+            result = cached_gather_context(query, limit, window_hours,
+                                           app_filter=app_filter, type_filter=type_filter)
             self.send_json(200, result)
 
         elif parsed.path == '/summary':
@@ -722,7 +1028,7 @@ class ContextHandler(BaseHTTPRequestHandler):
             self.send_json(404, {'error': 'not found', 'endpoints': [
                 '/health', '/context', '/summary', '/anomalies',
                 '/semantic', '/browser-captures', '/profile', '/context-card',
-                'POST /browser-capture',
+                'POST /browser-capture', 'POST /grade',
             ]})
 
     def do_POST(self):
@@ -734,9 +1040,58 @@ class ContextHandler(BaseHTTPRequestHandler):
                 body = self.rfile.read(length)
                 entry = json.loads(body.decode())
                 save_browser_capture(entry)
+
+                # P1-E: upsert browser capture into semantic collection if available
+                _try_load_semantic()
+                if _semantic_collection is not None and _semantic_embedder is not None:
+                    try:
+                        cap = entry
+                        doc = (
+                            f"[browser] [{cap.get('domain', '')}] [{cap.get('title', '')}]\n"
+                            f"{cap.get('selected_text', '')[:300]}"
+                        )
+                        ts  = cap.get('timestamp', '')
+                        url = cap.get('url', '')
+                        uid = f"browser_{abs(hash(url + ts)) % (10 ** 9)}"
+                        emb = _semantic_embedder.encode([doc]).tolist()
+                        _semantic_collection.upsert(
+                            ids=[uid],
+                            embeddings=emb,
+                            documents=[doc],
+                            metadatas=[{'source': 'browser', 'timestamp': ts}],
+                        )
+                    except Exception:
+                        pass  # semantic upsert is best-effort
+
                 self.send_json(200, {'ok': True, 'total': len(_browser_captures)})
             except Exception as e:
                 self.send_json(400, {'error': str(e)})
+
+        # P3-B: Cross-encoder grader endpoint
+        elif parsed.path == '/grade':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                payload = json.loads(body.decode())
+                query  = payload.get('query', '')
+                chunks = [c for c in payload.get('chunks', []) if c.strip()]
+                if not query or not chunks:
+                    self.send_json(400, {'error': 'query and chunks required'})
+                    return
+                grader   = _get_grader()
+                scores   = grader.predict([(query, chunk) for chunk in chunks[:10]])
+                scores_f = [round(float(s), 3) for s in scores]
+                relevant = any(s > 0.3 for s in scores_f)
+                best     = max(scores_f) if scores_f else 0.0
+                self.send_json(200, {'relevant': relevant, 'best_score': best, 'scores': scores_f})
+            except ImportError:
+                self.send_json(503, {
+                    'error': 'sentence_transformers not available.',
+                    'fix': 'pip install sentence-transformers',
+                })
+            except Exception as e:
+                self.send_json(500, {'error': str(e)})
+
         else:
             self.send_json(404, {'error': 'not found'})
 
@@ -747,7 +1102,7 @@ def main():
 
     print()
     print("  ┌─────────────────────────────────────┐")
-    print("  │       Augur Context API v0.3         │")
+    print("  │       Augur Context API v0.3.2       │")
     print("  │       localhost:3031                 │")
     print("  └─────────────────────────────────────┘")
     print()
@@ -763,6 +1118,12 @@ def main():
     except ImportError:
         print("  -  semantic search: not available (pip install chromadb sentence-transformers)")
 
+    try:
+        import rank_bm25  # noqa
+        print("  v  BM25 hybrid retrieval: available")
+    except ImportError:
+        print("  -  BM25 hybrid retrieval: not available (pip install rank-bm25)")
+
     # Attempt to warm up semantic scoring
     _try_load_semantic()
     if _semantic_available:
@@ -773,14 +1134,15 @@ def main():
     print()
     print("  Endpoints:")
     print("    GET  /health")
-    print("    GET  /context?q=...&limit=15&window_hours=24")
+    print(f"    GET  /context?q=...&limit={DEFAULT_LIMIT}&window_hours=24")
     print("    GET  /summary?date=YYYY-MM-DD")
     print("    GET  /anomalies?days=7")
-    print("    GET  /semantic?q=...&limit=15")
+    print("    GET  /semantic?q=...&limit=25")
     print("    GET  /browser-captures?limit=50")
     print("    GET  /profile?days=7")
     print("    GET  /context-card?days=7")
     print("    POST /browser-capture  (JSON body)")
+    print("    POST /grade  (JSON body: {query, chunks})")
     print()
     print("  Press Ctrl+C to stop.")
     print()

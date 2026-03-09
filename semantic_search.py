@@ -17,8 +17,10 @@ Requires:
 
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 import urllib.request
 import urllib.parse
 from datetime import datetime, timezone
@@ -28,7 +30,11 @@ CHROMA_PATH = os.path.expanduser("~/.screenpipe/augur_semantic_db")
 COLLECTION_NAME = "augur_captures"
 INDEX_INTERVAL = 300   # seconds between indexing passes
 BATCH_SIZE = 50        # captures per embedding batch
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
+# NOTE: changing this model requires deleting ~/.screenpipe/augur_semantic_db/ and rebuilding
+
+# P2-C: sentinel file marks that full historical index has been run
+FULL_INDEX_SENTINEL = os.path.expanduser("~/.screenpipe/augur_full_indexed")
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
@@ -40,6 +46,69 @@ def fetch_json(url):
         return None
 
 
+# ── P2-A: OCR text cleaning ──────────────────────────────────────────
+def clean_ocr_text(text: str) -> str:
+    """Strip non-printable chars, decoration runs, repeated chars, split-word artifacts."""
+    if not text:
+        return ''
+    # Strip non-printable / control characters (keep newlines and tabs)
+    text = ''.join(
+        ch for ch in text
+        if unicodedata.category(ch)[0] != 'C' or ch in ('\n', '\t', ' ')
+    )
+    # Remove runs of 3+ identical non-alphanumeric characters (decoration runs)
+    text = re.sub(r'([^a-zA-Z0-9\s])\1{2,}', '', text)
+    # Remove lines that are purely non-word characters (separators, borders)
+    lines = text.splitlines()
+    lines = [ln for ln in lines if re.search(r'[a-zA-Z0-9]', ln)]
+    text = ' '.join(lines)
+    # Collapse multiple spaces
+    text = re.sub(r' {2,}', ' ', text).strip()
+    return text
+
+
+# ── P2-A: Build structured embedding document ───────────────────────
+def build_index_document(item: dict) -> str:
+    """Prepend structured metadata header before embedding text."""
+    c        = item.get('content', {}) if 'content' in item else item
+    app      = (c.get('app_name')    or '')[:60]
+    window   = (c.get('window_name') or '')[:80]
+    url      = (c.get('browser_url') or '')[:120]
+    text     = clean_ocr_text(c.get('text') or c.get('transcription') or '')[:500]
+    ts       = (c.get('timestamp')   or '')[:16]   # "2024-03-08T14:32"
+    src_type = item.get('type', 'OCR')
+
+    header = f"[{ts}] [{src_type}] [{app}]"
+    if window and window != app:
+        header += f" [{window}]"
+    if url:
+        header += f" [{url[:80]}]"
+    return f"{header}\n{text}"
+
+
+# ── P2-D: Near-duplicate deduplication ──────────────────────────────
+def text_fingerprint(text: str) -> frozenset:
+    text = (text or '').lower().strip()
+    return frozenset(text[i:i+4] for i in range(max(0, len(text) - 3)))
+
+
+def jaccard(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def dedup_near_duplicate(items: list, threshold: float = 0.85) -> list:
+    kept, prints = [], []
+    for item in items:
+        text = item.get('content', {}).get('text', '') or ''
+        fp   = text_fingerprint(text)
+        if not any(jaccard(fp, p) >= threshold for p in prints):
+            kept.append(item)
+            prints.append(fp)
+    return kept
+
+
 # ── Chroma + embedder setup ─────────────────────────────────────────
 def get_client():
     import chromadb
@@ -47,9 +116,15 @@ def get_client():
 
 
 def get_collection(client):
+    # P2-B: HNSW parameter tuning for better recall
     return client.get_or_create_collection(
         name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
+        metadata={
+            "hnsw:space":           "cosine",
+            "hnsw:M":               16,
+            "hnsw:construction_ef": 200,
+            "hnsw:search_ef":       100,
+        },
     )
 
 
@@ -69,8 +144,8 @@ def capture_to_doc(item):
     ts = c.get('timestamp', '') or ''
     uid = str(c.get('frame_id') or ts or id(item))
 
-    # Build document string: context fields + text
-    doc = ' | '.join(filter(None, [app, window[:100], url[:200], text[:400]]))
+    # P2-A: use structured document format
+    doc = build_index_document(item)
     meta = {
         'type': item.get('type', ''),
         'app': app[:100],
@@ -80,6 +155,71 @@ def capture_to_doc(item):
         'text_preview': text[:300],
     }
     return uid, doc, meta
+
+
+def _get_uid(item):
+    """Extract the ID used for dedup checks."""
+    c = item.get('content', {})
+    return str(c.get('frame_id') or c.get('timestamp') or '')
+
+
+def _embed_and_upsert(collection, embedder, items):
+    """Convert items to docs and upsert into collection in batches."""
+    ids, docs, metas = [], [], []
+    for item in items:
+        uid, doc, meta = capture_to_doc(item)
+        if doc.strip() and len(doc) > 5:
+            ids.append(uid)
+            docs.append(doc)
+            metas.append(meta)
+
+    if not ids:
+        return 0
+
+    for i in range(0, len(ids), BATCH_SIZE):
+        b_ids   = ids[i:i + BATCH_SIZE]
+        b_docs  = docs[i:i + BATCH_SIZE]
+        b_metas = metas[i:i + BATCH_SIZE]
+        embeddings = embedder.encode(b_docs, show_progress_bar=False).tolist()
+        collection.upsert(ids=b_ids, embeddings=embeddings, documents=b_docs, metadatas=b_metas)
+
+    return len(ids)
+
+
+# ── P2-C: Full historical indexing ──────────────────────────────────
+def run_full_index(collection, embedder):
+    """Index all screenpipe history. Skips on subsequent runs via sentinel file."""
+    if os.path.exists(FULL_INDEX_SENTINEL):
+        return  # already ran full index once
+
+    print("  [full-index] Starting full historical index...")
+    try:
+        existing_ids = set(collection.get(include=[])['ids'])
+    except Exception:
+        existing_ids = set()
+
+    offset, batch, total = 0, 200, 0
+
+    while True:
+        data  = fetch_json(f"{SCREENPIPE_URL}/search?limit={batch}&offset={offset}") or {}
+        items = data.get('data', [])
+        if not items:
+            break
+        new_items = [i for i in items if _get_uid(i) not in existing_ids]
+        if new_items:
+            new_items = dedup_near_duplicate(new_items)
+            n = _embed_and_upsert(collection, embedder, new_items)
+            total += n
+            for i in new_items:
+                existing_ids.add(_get_uid(i))
+        print(f"  [full-index] offset={offset} items={len(items)} new={len(new_items)} total_indexed={total}")
+        if len(items) < batch:
+            break
+        offset += batch
+
+    with open(FULL_INDEX_SENTINEL, 'w') as f:
+        f.write(str(total))
+    print(f"  [full-index] Done. Indexed {total} historical captures.")
 
 
 # ── Indexing ─────────────────────────────────────────────────────────
@@ -109,26 +249,10 @@ def index_captures(embedder, collection, limit=200):
     if not new_items:
         return 0
 
-    ids, docs, metas = [], [], []
-    for item in new_items:
-        uid, doc, meta = capture_to_doc(item)
-        if doc.strip() and len(doc) > 5:
-            ids.append(uid)
-            docs.append(doc)
-            metas.append(meta)
+    # P2-D: deduplicate near-duplicates before indexing
+    new_items = dedup_near_duplicate(new_items)
 
-    if not ids:
-        return 0
-
-    # Batch embed + upsert
-    for i in range(0, len(ids), BATCH_SIZE):
-        b_ids = ids[i:i + BATCH_SIZE]
-        b_docs = docs[i:i + BATCH_SIZE]
-        b_metas = metas[i:i + BATCH_SIZE]
-        embeddings = embedder.encode(b_docs, show_progress_bar=False).tolist()
-        collection.upsert(ids=b_ids, embeddings=embeddings, documents=b_docs, metadatas=b_metas)
-
-    return len(ids)
+    return _embed_and_upsert(collection, embedder, new_items)
 
 
 # ── Querying ─────────────────────────────────────────────────────────
@@ -153,7 +277,9 @@ def semantic_query(query_text, n_results=15, embedder=None, collection=None):
     if embedder is None:
         embedder = get_embedder()
 
-    query_embedding = embedder.encode([query_text], show_progress_bar=False).tolist()
+    # BGE models require a query prefix for retrieval tasks (documents do not need it)
+    bge_query = f"Represent this sentence: {query_text}"
+    query_embedding = embedder.encode([bge_query], show_progress_bar=False).tolist()
     n = min(n_results, total)
 
     try:
@@ -262,12 +388,16 @@ def main():
 
     if '--index' in args:
         print("  Indexing captures (one pass)...")
+        # P2-C: run full historical index first if not done
+        run_full_index(collection, embedder)
         n = index_captures(embedder, collection)
         total = collection.count()
         print(f"  Done. Indexed {n} new captures. Total in store: {total}")
         return
 
     # Default: daemon
+    # P2-C: run full historical index once before entering incremental loop
+    run_full_index(collection, embedder)
     run_daemon(embedder, collection)
 
 
