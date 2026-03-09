@@ -1938,6 +1938,7 @@ async function detectLMStudio() {
     document.getElementById('modelBadge').textContent = `LM Studio · ${label} · local`;
     document.getElementById('modelBadge').style.color = 'var(--green)';
   } catch(e) {
+    loadedModel = null; // FIX 6: clear stale model state when LM Studio goes offline
     document.getElementById('modelBadge').textContent = 'LM Studio offline — start server in LM Studio app';
     document.getElementById('modelBadge').style.color = 'var(--red)';
   }
@@ -1968,9 +1969,9 @@ function parseTemporalQuery(q) {
   if (/\bthis\s+afternoon\b/.test(lower))                      return 10;
   if (/\btonight\b|\bthis\s+evening\b/.test(lower))           return 6;
   const hoursMatch = lower.match(/last\s+(\d+)\s+hours?/);
-  if (hoursMatch)   return parseInt(hoursMatch[1], 10) + 2;
+  if (hoursMatch)   return Math.min(parseInt(hoursMatch[1], 10), 720);
   const daysMatch  = lower.match(/last\s+(\d+)\s+days?/);
-  if (daysMatch)    return parseInt(daysMatch[1], 10) * 24;
+  if (daysMatch)    return Math.min(parseInt(daysMatch[1], 10) * 24, 720);
   return 24; // default
 }
 
@@ -1992,8 +1993,8 @@ async function gradeContext(question, contextBlock) {
 
 Question: ${question}
 
-Retrieved screen data (first 1500 chars):
-${contextBlock.slice(0, 1500)}
+Retrieved screen data (first 800 chars):
+${contextBlock.slice(0, 800)}
 
 Does this screen data contain specific, direct evidence to answer the question?
 Respond with exactly one word on line 1: YES or NO.
@@ -2084,13 +2085,21 @@ async function getScreenpipeContext(question) {
     }
 
     if (allChunks.length === 0) {
-      return { context: '\n\n[No recent screen data available.]', fallback, captureCount: 0 };
+      return { context: '', fallback, captureCount: 0 };
     }
 
     // Token-based budget
     const MODEL_CTX_TOKENS   = 8192;
     const RESPONSE_RESERVE   = 1000;
-    const SYSTEM_RESERVE     = 300;
+    const SYSTEM_BASE = `You are Augur, a personal context assistant. Answer questions using the screen capture evidence in [Screen context] below.
+
+RULES:
+1. Ground your answer in the context. Cite evidence as: (App: X, Window: Y, Time: HH:MM).
+2. Answer confidently from what you observe. If specific details are absent, summarize what IS visible and note any gaps naturally in your response.
+3. Do not invent or hallucinate details that are not in the context.
+4. "Recent" means the context block below — not your training knowledge.
+5. Keep answers focused and direct.`;
+    const SYSTEM_RESERVE     = 300 + approxTokens(SYSTEM_BASE) + approxTokens(userProfileCard || '') + 50; // base + actual prompt + buffer
     const historyTokens      = chatHistory.slice(-6).reduce((n, m) => n + approxTokens(m.content), 0);
     const availableTokens    = MODEL_CTX_TOKENS - RESPONSE_RESERVE - SYSTEM_RESERVE - historyTokens;
     const BUDGET_CHARS       = Math.max(2000, Math.min(12000, availableTokens * 4));
@@ -2141,6 +2150,9 @@ RULES:
     { role: 'user', content: question }
   ];
 
+  // Push user question before fetch so history stays in sync with UI even on error
+  chatHistory.push({ role: 'user', content: question });
+
   let responseText;
   try {
     const r = await fetch(`${LM_STUDIO}/v1/chat/completions`, {
@@ -2182,7 +2194,6 @@ RULES:
 
   appendMsg('ai', responseText);
 
-  chatHistory.push({ role: 'user', content: question });
   chatHistory.push({ role: 'assistant', content: responseText });
 }
 
@@ -2191,10 +2202,10 @@ async function handleCRAGFail(question, rewrite) {
     // One retry with rewritten query
     showTypingLabel('Refining search...');
     const { context: context2 } = await getScreenpipeContext(rewrite);
-    const { relevant: relevant2 } = await gradeContext(rewrite, context2);
 
-    if (relevant2) {
-      // Proceed to generation with context2 and original question
+    if (!context2 || context2.includes('[No recent screen data') || context2.trim().length < 50) {
+      // fall through to hard refuse
+    } else {
       await generateAnswer(question, context2, false);
       return;
     }
@@ -2231,20 +2242,37 @@ async function sendAI() {
     showTypingLabel('Searching screen captures...');
     const { context, fallback, captureCount } = await getScreenpipeContext(question);
 
+    // FIX 4: Guard empty context — total failure, nothing to send to the model
+    if (captureCount === 0 && fallback) {
+      removeTyping();
+      appendMsg('ai', "Couldn't retrieve any screen data. Make sure Augur is capturing.");
+      return;
+    }
+
     const ctxNote = captureCount > 0
       ? `Found ${captureCount} capture${captureCount !== 1 ? 's' : ''} — thinking...`
       : fallback ? 'Context server offline — thinking...' : 'No captures found — thinking...';
     showTypingLabel(ctxNote);
+
+    // FIX 1: Run CRAG grader; only call generateAnswer on YES
+    showTypingLabel('Grading relevance...');
+    const { relevant, rewrite } = await gradeContext(question, context);
+    if (!relevant) {
+      await handleCRAGFail(question, rewrite);
+      return;
+    }
 
     await generateAnswer(question, context, fallback);
 
   } catch(e) {
     removeTyping();
     appendMsg('ai', `**Error:** ${e.message}`);
+  } finally {
+    // FIX 3: Always reset thinking state, even on thrown errors
+    isThinking = false;
+    document.getElementById('sendBtn').disabled = false;
   }
 
-  isThinking = false;
-  document.getElementById('sendBtn').disabled = false;
   document.getElementById('aiInput').focus();
 }
 
@@ -2292,6 +2320,8 @@ function loadPersistedChat() {
     _suppressPersist = true;
     stored.forEach((m, i) => appendMsg(m.role, m.text, i === 0));
     _suppressPersist = false;
+    // Also rebuild chatHistory so multi-turn context works
+    chatHistory = stored.map(m => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.text }));
     requestAnimationFrame(() => { msgs.scrollTop = msgs.scrollHeight; });
   } catch(e) {
     _suppressPersist = false;

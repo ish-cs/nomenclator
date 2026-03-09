@@ -180,8 +180,9 @@ def _get_semantic_scores(query, n):
             embedder=_semantic_embedder,
             collection=_semantic_collection,
         )
-        return {str(r['id']): r['score'] for r in result.get('results', [])}
-    except Exception:
+        return {str(r.get('id', '')): r.get('score', 0.0) for r in result.get('results', []) if r.get('id')}
+    except Exception as e:
+        print(f'[semantic] scoring error: {e}', flush=True)
         return {}
 
 
@@ -321,7 +322,9 @@ CTX_CACHE_TTL = 60
 
 
 def cached_gather_context(query, limit, window_hours, **kwargs):
-    key = hashlib.md5(f"{query}|{limit}|{window_hours}".encode()).hexdigest()
+    app_filter = kwargs.get('app_filter', '')
+    type_filter = kwargs.get('type_filter', '')
+    key = hashlib.md5(f"{query}|{limit}|{window_hours}|{app_filter}|{type_filter}".encode()).hexdigest()
     if key in _ctx_cache:
         ts, result = _ctx_cache[key]
         if time.time() - ts < CTX_CACHE_TTL:
@@ -354,6 +357,8 @@ def save_browser_capture(entry):
     _browser_captures.append(entry)
     if len(_browser_captures) > BROWSER_CAPTURES_MAX:
         _browser_captures = _browser_captures[-BROWSER_CAPTURES_MAX:]
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    _browser_captures = [c for c in _browser_captures if c.get('timestamp', '') >= cutoff]
     try:
         os.makedirs(os.path.dirname(BROWSER_CAPTURES_FILE), exist_ok=True)
         with open(BROWSER_CAPTURES_FILE, 'w') as f:
@@ -527,13 +532,13 @@ def gather_context(query, limit, window_hours, app_filter='', type_filter=''):
             all_items.append(item)
 
     # ── Merge browser captures ───────────────────────────────────────
-    now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_dt = datetime.now(timezone.utc)
     cutoff_dt = now_dt - timedelta(seconds=window_hours * 3600)
     for cap in _browser_captures:
         ts_str = cap.get('timestamp') or cap.get('received_at', '')
         try:
             cap_dt = datetime.fromisoformat(
-                ts_str.replace('Z', '+00:00').replace('+00:00', '')
+                ts_str.replace('Z', '+00:00')
             )
             if cap_dt < cutoff_dt:
                 continue
@@ -551,15 +556,15 @@ def gather_context(query, limit, window_hours, app_filter='', type_filter=''):
     semantic_active = bool(semantic_scores)
 
     # Score: keyword_matches * 3 + recency (+ semantic bonus for OCR/audio)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = datetime.now(timezone.utc)
     window_ms = window_hours * 3600
     for item in all_items:
         if item.get('_source') == 'browser':
-            blob = item['_blob']
+            blob = item.get('_blob', '')
             kw_score = sum(min(blob.count(kw), 5) for kw in keywords)
             try:
                 ts = datetime.fromisoformat(
-                    item['_timestamp'].replace('Z', '+00:00').replace('+00:00', ''))
+                    item['_timestamp'].replace('Z', '+00:00'))
                 age_s = (now - ts).total_seconds()
             except Exception:
                 age_s = window_ms
@@ -586,7 +591,7 @@ def gather_context(query, limit, window_hours, app_filter='', type_filter=''):
             kw_score = sum(min(blob.count(kw), 5) for kw in keywords)
             try:
                 ts = datetime.fromisoformat(
-                    c.get('timestamp', '').replace('Z', '+00:00').replace('+00:00', ''))
+                    c.get('timestamp', '').replace('Z', '+00:00'))
                 age_s = (now - ts).total_seconds()
             except Exception:
                 age_s = window_ms
@@ -972,6 +977,8 @@ class ContextHandler(BaseHTTPRequestHandler):
             if not query:
                 self.send_json(400, {'error': 'q parameter required'})
                 return
+            if len(query) > 1000:
+                query = query[:1000]
             result = cached_gather_context(query, limit, window_hours,
                                            app_filter=app_filter, type_filter=type_filter)
             self.send_json(200, result)
