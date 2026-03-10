@@ -1621,7 +1621,7 @@ async function loadFeed() {
 
     _liveFeedCache = d.data || []; // keep in sync for AI context
 
-    const frames = d.data?.filter(x => x.type === 'OCR').length || 0;
+    const frames = d.data?.filter(x => x.type === 'OCR' || x.type === 'UI').length || 0;
     const audio = d.data?.filter(x => x.type === 'Audio').length || 0;
     document.getElementById('statFrames').textContent = frames;
     document.getElementById('statAudio').textContent = audio;
@@ -1792,10 +1792,10 @@ function setSQL(q) {
 // ── Render card ───────────────────────────────────────────────────
 function renderCard(item, highlight) {
   const c = item.content;
-  const isOCR = item.type === 'OCR';
+  const isOCR = item.type === 'OCR' || item.type === 'UI';
   const time = new Date(c.timestamp).toLocaleTimeString();
   const date = new Date(c.timestamp).toLocaleDateString();
-  
+
   let text = isOCR ? (c.text || '') : (c.transcription || '');
   if (highlight && text) {
     const re = new RegExp(`(${highlight.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
@@ -2071,12 +2071,12 @@ async function getScreenpipeContext(question) {
     const liveChunks = _liveFeedCache.slice(0, 20).map(item => {
       const c = item.content || {};
       const time = c.timestamp ? new Date(c.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
-      const isOCR = item.type === 'OCR';
+      const isOCR = item.type === 'OCR' || item.type === 'UI';
       const appLine = isOCR
         ? `App: ${c.app_name || 'unknown'} | Window: ${(c.window_name || '').slice(0, 60)}`
         : `App: audio | Window: ${(c.device_name || '').slice(0, 60)}`;
       const text = ((isOCR ? c.text : c.transcription) || '').slice(0, 400);
-      return `[${time}] [${isOCR ? 'OCR' : 'AUDIO'}] ${appLine}\n${text}`;
+      return `[${time}] [${isOCR ? 'SCREEN' : 'AUDIO'}] ${appLine}\n${text}`;
     });
 
     // Merge: live feed first (real-time), then query-ranked (relevant history)
