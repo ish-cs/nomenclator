@@ -1125,14 +1125,14 @@
         <div class="section-label">query the sqlite database directly</div>
         <div style="display:flex;gap:8px;margin-top:8px">
           <input type="text" id="sqlInput" style="flex:1"
-                 placeholder="SELECT * FROM frames LIMIT 10"
+                 placeholder="SELECT * FROM ocr_text LIMIT 10"
                  onkeydown="if(event.key==='Enter') doSQL()">
           <button class="search-btn" onclick="doSQL()">RUN →</button>
         </div>
         <div style="font-size:10px;color:var(--dimmer);margin-top:8px">
-          Try: <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT app_name, window_name, COUNT(*) as count FROM frames GROUP BY app_name ORDER BY count DESC LIMIT 20')">top apps by screen time</span>
+          Try: <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT app_name, window_name, COUNT(*) as count FROM ocr_text GROUP BY app_name ORDER BY count DESC LIMIT 20')">top apps by screen time</span>
           &nbsp;·&nbsp;
-          <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT * FROM frames ORDER BY timestamp DESC LIMIT 10')">recent frames</span>
+          <span style="color:var(--blue);cursor:pointer" onclick="setSQL('SELECT * FROM audio_transcriptions ORDER BY timestamp DESC LIMIT 10')">recent audio</span>
         </div>
       </div>
       <div id="sqlResults"></div>
@@ -1212,11 +1212,11 @@ async function loadStorageStats() {
   try {
     const [totalFrames, totalAudio, daily] = await Promise.all([
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM frames" }) }).then(r=>r.json()).catch(()=>[{n:0}]),
+        body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM ocr_text LIMIT 1" }) }).then(r=>r.json()).catch(()=>[{n:0}]),
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM audio_transcriptions" }) }).then(r=>r.json()).catch(()=>[{n:0}]),
+        body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM audio_transcriptions LIMIT 1" }) }).then(r=>r.json()).catch(()=>[{n:0}]),
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: "SELECT date(timestamp) as day, COUNT(*) as cnt FROM frames GROUP BY day ORDER BY day DESC LIMIT 7" }) }).then(r=>r.json()).catch(()=>[])
+        body: JSON.stringify({ query: "SELECT date(timestamp) as day, COUNT(*) as cnt FROM audio_transcriptions GROUP BY day ORDER BY day DESC LIMIT 7" }) }).then(r=>r.json()).catch(()=>[])
     ]);
 
     const frames = totalFrames[0]?.n ?? 0;
@@ -1260,19 +1260,15 @@ async function cleanupOldData() {
 
   // Count before
   const beforeRes = await fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM frames" }) }).then(r=>r.json()).catch(()=>[{n:'?'}]);
+    body: JSON.stringify({ query: "SELECT COUNT(*) as n FROM ocr_text LIMIT 1" }) }).then(r=>r.json()).catch(()=>[{n:'?'}]);
   const before = beforeRes[0]?.n ?? '?';
 
   if (!confirm(`Delete all frames and audio older than ${days} days? (${before} total frames currently)`)) return;
 
   const threshold = `datetime('now', '-${days} days')`;
   try {
-    await Promise.all([
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `DELETE FROM frames WHERE timestamp < ${threshold}` }) }).then(r=>r.json()),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `DELETE FROM audio_transcriptions WHERE timestamp < ${threshold}` }) }).then(r=>r.json())
-    ]);
+    await fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ query: `DELETE FROM audio_transcriptions WHERE timestamp < ${threshold}` }) }).then(r=>r.json());
 
     showToast(`Cleaned records older than ${days} days`, 'green');
     await loadStorageStats(); // refresh counts
@@ -1294,12 +1290,11 @@ async function dailySummary() {
   try {
     const today = new Date().toISOString().split('T')[0];
 
-    const [todayFrames, appBreakdown] = await Promise.all([
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT f.app_name, f.window_name, ot.text, f.timestamp FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp) = '${today}' ORDER BY f.timestamp DESC LIMIT 60` }) }).then(r=>r.json()).catch(()=>[]),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT app_name, COUNT(*) as cnt FROM frames WHERE date(timestamp) = '${today}' GROUP BY app_name ORDER BY cnt DESC LIMIT 10` }) }).then(r=>r.json()).catch(()=>[])
-    ]);
+    const _dsSearch = await fetch(`${API}/search?content_type=ocr&limit=60&start_time=${today}T00:00:00Z`).then(r=>r.json()).catch(()=>({data:[]}));
+    const todayFrames = (_dsSearch.data || []).map(r => r.content);
+    const _dsCounts = {};
+    for (const f of todayFrames) { const a = f.app_name || 'Unknown'; _dsCounts[a] = (_dsCounts[a]||0) + 1; }
+    const appBreakdown = Object.entries(_dsCounts).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([app_name,cnt])=>({app_name,cnt}));
 
     if (!todayFrames || todayFrames.length === 0) {
       removeTyping();
@@ -1381,11 +1376,17 @@ async function loadTimeline() {
 
   try {
     const today = new Date().toISOString().split('T')[0];
-    const result = await fetch(`${API}/raw_sql`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ query: `SELECT app_name, strftime('%H', timestamp) as hr, COUNT(*) as cnt FROM frames WHERE date(timestamp)='${today}' AND app_name IS NOT NULL GROUP BY app_name, hr ORDER BY app_name, hr` })
-    }).then(r => r.json()).catch(() => []);
+    const _tlSearch = await fetch(`${API}/search?content_type=ocr&limit=500&start_time=${today}T00:00:00Z`).then(r=>r.json()).catch(()=>({data:[]}));
+    const _tlAgg = {};
+    for (const row of (_tlSearch.data || [])) {
+      const c = row.content;
+      if (!c.app_name) continue;
+      const hr = new Date(c.timestamp).getHours().toString().padStart(2,'0');
+      const key = `${c.app_name}|${hr}`;
+      if (!_tlAgg[key]) _tlAgg[key] = { app_name: c.app_name, hr, cnt: 0 };
+      _tlAgg[key].cnt++;
+    }
+    const result = Object.values(_tlAgg).sort((a,b) => a.app_name.localeCompare(b.app_name) || a.hr.localeCompare(b.hr));
 
     if (!result || result.length === 0) {
       el.innerHTML = `<div class="empty">
@@ -1453,11 +1454,12 @@ async function showTimelineDetail(app, hr) {
   detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00–${hrPad}:59</div><div class="loading"><div class="spinner"></div> Loading...</div>`;
 
   try {
-    const rows = await fetch(`${API}/raw_sql`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ query: `SELECT f.timestamp, f.window_name, ot.text FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp)='${today}' AND f.app_name='${app.replace(/'/g,"''")}' AND strftime('%H',f.timestamp)='${hrPad}' ORDER BY f.timestamp LIMIT 10` })
-    }).then(r => r.json()).catch(() => []);
+    const _tdStart = `${today}T${hrPad}:00:00Z`;
+    const _tdEnd = `${today}T${hrPad}:59:59Z`;
+    const _tdSearch = await fetch(`${API}/search?content_type=ocr&limit=30&start_time=${_tdStart}&end_time=${_tdEnd}`).then(r=>r.json()).catch(()=>({data:[]}));
+    const rows = (_tdSearch.data || []).filter(r => r.content.app_name === app).slice(0,10).map(r => ({
+      timestamp: r.content.timestamp, window_name: r.content.window_name, text: r.content.text
+    }));
 
     if (!rows || rows.length === 0) {
       detail.innerHTML = `<div class="timeline-detail-title">${app} · ${hrPad}:00</div><div style="color:var(--dimmer)">No captures</div>`;
@@ -1482,24 +1484,26 @@ async function exportContextSnapshot() {
   showToast('Building context snapshot...', 'green');
   try {
     const sevenDaysAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+    const sevenDaysAgoISO = new Date(Date.now() - 7 * 86400000).toISOString();
 
-    const [topApps, activeHours, urlCount, audioChunks, sampleText] = await Promise.all([
+    const [_snapSearch, audioChunks] = await Promise.all([
+      fetch(`${API}/search?content_type=ocr&limit=1000&start_time=${sevenDaysAgoISO}`).then(r=>r.json()).catch(()=>({data:[]})),
       fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT app_name, ROUND(COUNT(*) * 30.0 / 3600, 2) as hours FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' GROUP BY app_name ORDER BY hours DESC LIMIT 10` })
-      }).then(r=>r.json()).catch(()=>[]),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT strftime('%H', timestamp) as hr, COUNT(*) as cnt FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' GROUP BY hr ORDER BY cnt DESC LIMIT 5` })
-      }).then(r=>r.json()).catch(()=>[]),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT COUNT(DISTINCT browser_url) as n FROM frames WHERE date(timestamp) >= '${sevenDaysAgo}' AND browser_url IS NOT NULL AND browser_url != ''` })
+        body: JSON.stringify({ query: `SELECT COUNT(*) as n FROM audio_transcriptions WHERE date(timestamp) >= '${sevenDaysAgo}' LIMIT 1` })
       }).then(r=>r.json()).catch(()=>[{n:0}]),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT COUNT(*) as n FROM audio_transcriptions WHERE date(timestamp) >= '${sevenDaysAgo}'` })
-      }).then(r=>r.json()).catch(()=>[{n:0}]),
-      fetch(`${API}/raw_sql`, { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ query: `SELECT ot.text FROM frames f JOIN ocr_text ot ON ot.frame_id = f.id WHERE date(f.timestamp) >= '${sevenDaysAgo}' AND ot.text IS NOT NULL LIMIT 400` })
-      }).then(r=>r.json()).catch(()=>[]),
     ]);
+
+    const _snapFrames = (_snapSearch.data || []).map(r => r.content);
+    const _appCntMap = {}, _hrCntMap = {}, _urlSet = new Set();
+    for (const f of _snapFrames) {
+      if (f.app_name) _appCntMap[f.app_name] = (_appCntMap[f.app_name]||0) + 1;
+      if (f.timestamp) { const hr = new Date(f.timestamp).getHours().toString().padStart(2,'0'); _hrCntMap[hr] = (_hrCntMap[hr]||0) + 1; }
+      if (f.browser_url) _urlSet.add(f.browser_url);
+    }
+    const topApps = Object.entries(_appCntMap).sort((a,b)=>b[1]-a[1]).slice(0,10).map(([app_name,cnt])=>({app_name, hours: +(cnt*30/3600).toFixed(2)}));
+    const activeHours = Object.entries(_hrCntMap).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([hr])=>({hr}));
+    const urlCount = [{n: _urlSet.size}];
+    const sampleText = _snapFrames.slice(0,400).map(f=>({text:f.text}));
 
     // Word frequency for topics
     const stopWords = new Set(['what','have','been','the','a','an','is','are','was','were','do','did','can','all','on','in','at','to','for','of','and','or','my','your','any','some','this','that','with','from','by','as','it','its','be','has','had','will','would','could','should','just','not','but','so','if','then','than','too','very','also','more','one','two','about','get','new','use','used','into','file']);
